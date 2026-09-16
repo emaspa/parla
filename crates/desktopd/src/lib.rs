@@ -1,0 +1,18 @@
+//! desktopd: the executor for parla. One implementation of the desktop tool
+//! surface (plan §1), exposed as a Rust library for the daemon's fast path
+//! and — in P3 — as an MCP server for the agent path.
+
+pub mod config;
+pub mod executor;
+pub mod injector;
+pub mod kwin;
+pub mod launcher;
+pub mod notify;
+pub mod screenshot;
+pub mod shortcuts;
+pub mod tmuxctl;
+pub mod windows;
+
+pub use config::DesktopdConfig;
+pub use executor::Executor;
+pub use windows::Window;

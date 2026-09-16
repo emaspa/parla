@@ -1,0 +1,17 @@
+[package]
+name = "parla-grammar"
+description = "Fast-path voice command grammar for parla: intent parsing, .desktop index, fuzzy matching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+fuzzy-matcher = { workspace = true }
+unicase = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }

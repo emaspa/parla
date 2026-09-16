@@ -1,0 +1,24 @@
+[package]
+name = "parlad"
+description = "parla daemon: PipeWire capture, Silero VAD, whisper.cpp ASR, PTT hotkeys, router, tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "parlad"
+path = "src/main.rs"
+
+[dependencies]
+parla-grammar = { path = "../grammar" }
+desktopd = { path = "../desktopd" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+zbus = { workspace = true }
+whisper-rs = { version = "0.16", features = ["cuda"] }
+cpal = "0.15"

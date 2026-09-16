@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/parlad", "crates/desktopd", "crates/grammar"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sparvoli/parla"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time"] }
+fuzzy-matcher = "0.3"
+unicase = "2"
+
+[profile.release]
+lto = "thin"

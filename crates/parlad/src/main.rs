@@ -10,6 +10,7 @@ mod audio;
 mod config;
 mod cues;
 mod hotkeys;
+mod instance;
 mod judge;
 mod lock;
 mod router;
@@ -17,9 +18,12 @@ mod typesafe;
 mod vad;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
-use tokio::sync::watch;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use asr::Asr;
 use audio::CaptureSession;
@@ -56,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
+    let instance = instance::InstanceLock::acquire()?;
+    tracing::debug!("instance lock {}", instance.path().display());
     let cfg = Arc::new(DaemonConfig::load()?);
 
     tracing::info!("starting executor (injector probe, desktop index)...");
@@ -85,14 +91,7 @@ async fn run() -> anyhow::Result<()> {
     // lock watcher: pause everything while the session is locked
     let conn = zbus::Connection::session().await?;
     let (lock_tx, lock_rx) = watch::channel(lock::is_locked(&conn).await);
-    {
-        let conn2 = conn.clone();
-        tokio::spawn(async move {
-            if let Err(e) = lock::watch_lock(conn2, lock_tx).await {
-                tracing::error!("lock watcher died: {e:#}");
-            }
-        });
-    }
+    tokio::spawn(lock::watch_lock(conn.clone(), lock_tx));
     if *lock_rx.borrow() {
         tracing::info!("session is locked; waiting for unlock");
     }
@@ -118,13 +117,32 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&grammar),
         judge,
     ));
-    let mut capture: Option<(Mode, CaptureSession)> = None;
+
+    // One worker handles utterances in release order, so two quick
+    // dictations can never be typed interleaved. The hotkey loop only
+    // enqueues and stays responsive.
+    let (job_tx, job_rx) = mpsc::channel::<Job>(JOB_QUEUE);
+    let worker = tokio::spawn(worker(
+        job_rx,
+        Arc::clone(&cfg),
+        Arc::clone(&asr),
+        Arc::clone(&router),
+        lock_rx.clone(),
+    ));
+
+    let mut capture: Option<Capture> = None;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
 
     tracing::info!("parlad ready");
-    loop {
+    let outcome = loop {
+        let deadline = capture.as_ref().map(|c| c.deadline);
         tokio::select! {
             ev = hotkey_rx.recv() => {
-                let Some(ev) = ev else { break };
+                let Some(ev) = ev else {
+                    break Err(anyhow::anyhow!(
+                        "hotkey signal loop ended; exiting so the service manager restarts parlad"
+                    ));
+                };
                 match ev {
                     HotkeyEvent::DictatePressed => {
                         start_capture(&mut capture, Mode::Dictate, &cfg, &lock_rx);
@@ -133,25 +151,104 @@ async fn run() -> anyhow::Result<()> {
                         start_capture(&mut capture, Mode::Command, &cfg, &lock_rx);
                     }
                     HotkeyEvent::DictateReleased => {
-                        finish_capture(&mut capture, Mode::Dictate, &cfg, &asr, &router);
+                        finish_capture(&mut capture, Some(Mode::Dictate), &cfg, &lock_rx, &job_tx);
                     }
                     HotkeyEvent::CommandReleased => {
-                        finish_capture(&mut capture, Mode::Command, &cfg, &asr, &router);
+                        finish_capture(&mut capture, Some(Mode::Command), &cfg, &lock_rx, &job_tx);
                     }
                 }
             }
+            ready = capture_ready(&mut capture) => {
+                match ready {
+                    Ok(name) => {
+                        let mode = capture.as_ref().map(|c| c.mode);
+                        tracing::info!("{mode:?} capture started on {name}");
+                    }
+                    Err(e) => {
+                        tracing::error!("capture start failed: {e:#}");
+                        capture = None;
+                        if cfg.router.cues {
+                            cues::play(cues::Cue::Error);
+                        }
+                        notify("parla capture failed", &format!("{e:#}"));
+                    }
+                }
+            }
+            _ = hold_expired(deadline) => {
+                tracing::warn!(
+                    "hotkey held longer than {} ms without a release; finishing capture",
+                    cfg.audio.max_hold_ms
+                );
+                finish_capture(&mut capture, None, &cfg, &lock_rx, &job_tx);
+            }
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
-                hotkeys.unregister().await;
-                break;
+                tracing::info!("SIGINT: shutting down");
+                break Ok(());
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM: shutting down");
+                break Ok(());
             }
         }
+    };
+
+    hotkeys.unregister().await;
+    // A capture still running is abandoned: dropping it stops the thread.
+    drop(capture);
+    // Let a queued or in-flight utterance finish, but not for ever.
+    drop(job_tx);
+    match tokio::time::timeout(SHUTDOWN_GRACE, worker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("utterance worker panicked: {e}"),
+        Err(_) => tracing::warn!(
+            "utterance still in flight after {}s; abandoning it",
+            SHUTDOWN_GRACE.as_secs()
+        ),
     }
-    Ok(())
+    drop(instance);
+    outcome
+}
+
+/// Queue depth for finished captures waiting on ASR. Deeper than anyone can
+/// hold-and-release in the time one utterance takes to transcribe.
+const JOB_QUEUE: usize = 8;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// How long a stopped capture may take to hand over its samples.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// A running push-to-talk capture.
+struct Capture {
+    mode: Mode,
+    session: CaptureSession,
+    /// When the hold is treated as released even without a Released signal.
+    deadline: Instant,
+}
+
+/// A finished capture, queued for transcription and routing.
+struct Job {
+    mode: Mode,
+    samples: audio::Stopped,
+}
+
+/// Resolves when the active capture's device opens or fails; pends for ever
+/// otherwise (or once it has resolved), so it is safe as a `select!` arm.
+async fn capture_ready(capture: &mut Option<Capture>) -> anyhow::Result<String> {
+    match capture {
+        Some(c) => c.session.ready().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves at the active capture's hold deadline; pends for ever otherwise.
+async fn hold_expired(deadline: Option<Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn start_capture(
-    capture: &mut Option<(Mode, CaptureSession)>,
+    capture: &mut Option<Capture>,
     mode: Mode,
     cfg: &DaemonConfig,
     lock_rx: &watch::Receiver<bool>,
@@ -167,13 +264,20 @@ fn start_capture(
         notify("parla", "Session locked — voice paused");
         return;
     }
-    match CaptureSession::start(cfg.audio.device.as_deref(), cfg.audio.sample_rate) {
+    // Room for the whole hold plus a little slack; the buffer is capped
+    // there, so a runaway stream cannot eat memory.
+    let max_samples = samples_for_ms(cfg.audio.max_hold_ms + 1_000);
+    match CaptureSession::start(cfg.audio.device.clone(), max_samples) {
         Ok(session) => {
-            tracing::info!("{mode:?} capture started on {}", session.device_name());
+            tracing::debug!("{mode:?} capture starting");
             if cfg.router.cues {
                 cues::play(cues::Cue::Start);
             }
-            *capture = Some((mode, session));
+            *capture = Some(Capture {
+                mode,
+                session,
+                deadline: Instant::now() + Duration::from_millis(cfg.audio.max_hold_ms),
+            });
         }
         Err(e) => {
             tracing::error!("capture start failed: {e:#}");
@@ -185,65 +289,121 @@ fn start_capture(
     }
 }
 
+/// Stop the active capture and queue it for processing. `released` is the
+/// mode whose key was released, or None when the hold timer fired.
 fn finish_capture(
-    capture: &mut Option<(Mode, CaptureSession)>,
-    mode: Mode,
+    capture: &mut Option<Capture>,
+    released: Option<Mode>,
     cfg: &DaemonConfig,
-    asr: &Arc<Asr>,
-    router: &Arc<Router>,
+    lock_rx: &watch::Receiver<bool>,
+    job_tx: &mpsc::Sender<Job>,
 ) {
-    let Some((captured_mode, session)) = capture.take() else {
+    let Some(Capture { mode, session, .. }) = capture.take() else {
         tracing::debug!("release without active capture");
         return;
     };
-    if captured_mode != mode {
-        tracing::warn!("release {mode:?} but captured {captured_mode:?}; using captured mode");
+    if let Some(released) = released {
+        if released != mode {
+            tracing::warn!("release {released:?} but captured {mode:?}; using captured mode");
+        }
     }
     if cfg.router.cues {
         cues::play(cues::Cue::Stop);
     }
     let samples = session.stop();
-    let rate = cfg.audio.sample_rate;
-    let audio_cfg = cfg.audio.clone();
-    let router_cfg = cfg.router.clone();
-    let asr = Arc::clone(asr);
-    let router = Arc::clone(router);
-    tokio::spawn(async move {
-        let outcome = process(samples, rate, &audio_cfg, asr, &router, captured_mode).await;
+    if *lock_rx.borrow() {
+        // Locked between press and release: whatever was said goes nowhere.
+        tracing::info!("session locked during {mode:?} capture; discarding utterance");
+        if cfg.router.cues {
+            cues::play(cues::Cue::Error);
+        }
+        return;
+    }
+    match job_tx.try_send(Job { mode, samples }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::error!("{JOB_QUEUE} utterances already waiting on ASR; dropping this one");
+            if cfg.router.cues {
+                cues::play(cues::Cue::Error);
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::error!("utterance worker is gone; dropping {mode:?} utterance");
+        }
+    }
+}
+
+/// Process queued utterances one at a time, in the order they were released.
+async fn worker(
+    mut jobs: mpsc::Receiver<Job>,
+    cfg: Arc<DaemonConfig>,
+    asr: Arc<Asr>,
+    router: Arc<Router>,
+    lock_rx: watch::Receiver<bool>,
+) {
+    while let Some(Job { mode, samples }) = jobs.recv().await {
+        let outcome = process(samples, &cfg.audio, &asr, &router, &lock_rx, mode).await;
         match outcome {
-            Ok(msg) => {
-                tracing::info!("{captured_mode:?} done: {msg}");
-                if router_cfg.notify_results {
+            Ok(Outcome::Done(msg)) => {
+                tracing::info!("{mode:?} done: {msg}");
+                if cfg.router.notify_results {
                     notify("parla", &msg);
                 }
             }
-            Err(e) => {
-                tracing::warn!("{captured_mode:?} failed: {e:#}");
-                if router_cfg.cues {
+            Ok(Outcome::Locked) => {
+                tracing::info!("session locked; discarding transcribed {mode:?} utterance");
+                if cfg.router.cues {
                     cues::play(cues::Cue::Error);
                 }
-                if router_cfg.notify_results {
+            }
+            Err(e) => {
+                tracing::warn!("{mode:?} failed: {e:#}");
+                if cfg.router.cues {
+                    cues::play(cues::Cue::Error);
+                }
+                if cfg.router.notify_results {
                     notify("parla", &format!("{e:#}"));
                 }
             }
         }
-    });
+    }
+}
+
+enum Outcome {
+    Done(String),
+    /// The session locked before anything was injected or executed.
+    Locked,
 }
 
 async fn process(
-    samples: Vec<f32>,
-    rate: u32,
+    samples: audio::Stopped,
     audio_cfg: &config::AudioConfig,
-    asr: Arc<Asr>,
+    asr: &Arc<Asr>,
     router: &Router,
+    lock_rx: &watch::Receiver<bool>,
     mode: Mode,
-) -> anyhow::Result<String> {
-    let trimmed = vad::validate(&samples, rate, audio_cfg)?;
+) -> anyhow::Result<Outcome> {
+    // The capture thread hands the samples over as soon as it closes the
+    // stream; if PipeWire wedges that close, do not wedge the whole queue.
+    let samples = tokio::time::timeout(STOP_GRACE, samples)
+        .await
+        .context("capture device did not stop in time")??;
+    let trimmed = vad::validate(&samples, audio::SAMPLE_RATE, audio_cfg)?;
+    let asr = Arc::clone(asr);
     let transcript = tokio::task::spawn_blocking(move || asr.transcribe(&trimmed))
         .await
         .context("ASR task panicked")??;
     anyhow::ensure!(!transcript.is_empty(), "heard nothing usable");
-    router.handle(mode, &transcript).await
+    // Last check before anything touches the desktop: transcription takes
+    // long enough for the screen to have locked in the meantime.
+    if *lock_rx.borrow() {
+        return Ok(Outcome::Locked);
+    }
+    router.handle(mode, &transcript).await.map(Outcome::Done)
+}
+
+fn samples_for_ms(ms: u64) -> usize {
+    (u64::from(audio::SAMPLE_RATE) * ms / 1000) as usize
 }
 
 fn notify(summary: &str, body: &str) {

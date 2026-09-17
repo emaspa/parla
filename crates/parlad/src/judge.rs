@@ -742,6 +742,13 @@ mod tests {
             id: id.into(),
             title: title.into(),
             class: class.into(),
+            resource_name: String::new(),
+            desktop: 1,
+            active: false,
+            minimized: false,
+            stacking: 0,
+            pid: 0,
+            normal: true,
         }
     }
 

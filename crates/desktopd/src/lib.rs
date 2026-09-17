@@ -16,5 +16,5 @@ pub mod tmuxctl;
 pub mod windows;
 
 pub use config::DesktopdConfig;
-pub use executor::Executor;
-pub use windows::Window;
+pub use executor::{DesktopState, Executor, Outcome, WindowOp};
+pub use windows::{Window, WindowError};

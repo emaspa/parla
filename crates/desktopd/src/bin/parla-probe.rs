@@ -4,6 +4,8 @@
 //! Usage:
 //!   parla-probe injector            # select + report active injector
 //!   parla-probe windows             # list windows
+//!   parla-probe snapshot            # everything the judged path sees, as JSON
+//!   parla-probe resolve QUERY       # which window QUERY would target (no action)
 //!   parla-probe desktops            # list virtual desktops, mark current
 //!   parla-probe apps QUERY          # resolve QUERY against the .desktop index
 //!   parla-probe type TEXT           # type into the FOCUSED window (careful)
@@ -36,6 +38,18 @@ async fn main() -> anyhow::Result<()> {
             let exec = Executor::new(DesktopdConfig::default()).await?;
             for w in exec.list_windows().await? {
                 println!("{}  [{}]  {}", w.id, w.class, w.title);
+            }
+        }
+        "snapshot" => {
+            let exec = Executor::new(DesktopdConfig::default()).await?;
+            println!("{}", serde_json::to_string_pretty(&exec.snapshot().await)?);
+        }
+        "resolve" => {
+            let query = args.get(1).context("usage: resolve QUERY")?;
+            let exec = Executor::new(DesktopdConfig::default()).await?;
+            match exec.resolve_window(query).await {
+                Ok(w) => println!("{} [{}] {}", w.id, w.class, w.title),
+                Err(e) => println!("{query} -> {e:#}"),
             }
         }
         "desktops" => {

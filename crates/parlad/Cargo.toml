@@ -21,7 +21,9 @@ serde = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 zbus = { workspace = true }
-whisper-rs = { version = "0.16", features = ["cuda"] }
+whisper-rs = { version = "0.16", features = ["cuda", "tracing_backend"] }
+# Only for the ggml backend registry, to tell whether the GPU came up.
+whisper-rs-sys = "0.15"
 cpal = "0.15"
 futures-util = "0.3.34"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -92,7 +92,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // lock watcher: pause everything while the session is locked
-    let conn = zbus::Connection::session().await?;
+    let conn = desktopd::bus::session().await?;
     let (lock_tx, lock_rx) = watch::channel(lock::is_locked(&conn).await);
     tokio::spawn(lock::watch_lock(conn.clone(), lock_tx));
     if *lock_rx.borrow() {
@@ -549,7 +549,7 @@ async fn check() -> anyhow::Result<()> {
         Ok(e) => println!("desktop index: resolved 'konsole' -> {}", e.id),
         Err(e) => println!("desktop index: FAILED ({e})"),
     }
-    let conn = zbus::Connection::session().await?;
+    let conn = desktopd::bus::session().await?;
     println!("session locked: {}", lock::is_locked(&conn).await);
     println!("all checks passed");
     Ok(())

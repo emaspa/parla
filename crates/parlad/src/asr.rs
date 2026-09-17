@@ -27,12 +27,25 @@ impl Asr {
             "whisper model not found at {} (fetch it: scripts/fetch-model.sh)",
             cfg.model_path.display()
         );
+        // ggml and whisper.cpp print to stderr by default; route them
+        // through tracing so their lines carry a level and can be filtered
+        // like everything else (the whisper_rs target).
+        whisper_rs::install_logging_hooks();
         let mut ctx_params = WhisperContextParameters::default();
         ctx_params.use_gpu(true);
         let t0 = std::time::Instant::now();
         let ctx = WhisperContext::new_with_params(Path::new(&cfg.model_path), ctx_params)
             .map_err(|e| anyhow::anyhow!("failed to load whisper model: {e}"))?;
         tracing::info!("loaded whisper model in {:.1}s", t0.elapsed().as_secs_f32());
+        // whisper.cpp falls back to the CPU without failing when CUDA cannot
+        // initialise (no driver, wrong library); on this model that means
+        // seconds per utterance instead of a few hundred ms.
+        if !gpu_available() {
+            tracing::warn!(
+                "no GPU backend: whisper.cpp is running on the CPU \
+                 (built with the cuda feature; check the CUDA driver and libraries)"
+            );
+        }
         Ok(Self {
             ctx,
             threads: cfg.threads as i32,
@@ -86,6 +99,24 @@ impl Asr {
         );
 
         Ok(filter(&self.blocklist, &text))
+    }
+}
+
+/// Does ggml's backend registry hold a GPU device? Under the `cuda` feature
+/// the CUDA backend is linked in, but it registers no device when the driver
+/// cannot be initialised, which is what a silent CPU fallback looks like.
+fn gpu_available() -> bool {
+    use whisper_rs_sys::{
+        ggml_backend_dev_count, ggml_backend_dev_get, ggml_backend_dev_type,
+        ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU as GPU,
+    };
+    // SAFETY: plain reads of ggml's process-wide registry; the indices come
+    // from its own count, and the model has already been loaded through it.
+    unsafe {
+        (0..ggml_backend_dev_count())
+            .map(|i| ggml_backend_dev_get(i))
+            .filter(|d| !d.is_null())
+            .any(|d| ggml_backend_dev_type(d) == GPU)
     }
 }
 

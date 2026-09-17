@@ -122,7 +122,7 @@ impl HotkeyManager {
         dictate_chord: &str,
         command_chord: &str,
     ) -> anyhow::Result<(Self, mpsc::Receiver<HotkeyEvent>)> {
-        let conn = Connection::session().await?;
+        let conn = desktopd::bus::session().await?;
         let dictate_key = parse_chord(dictate_chord)
             .with_context(|| format!("bad dictate chord {dictate_chord:?}"))?;
         let command_key = parse_chord(command_chord)

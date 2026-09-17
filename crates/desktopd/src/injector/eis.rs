@@ -45,6 +45,12 @@ const CAPS_KEYBOARD: i32 = 1;
 const RECONNECT_ATTEMPTS: u32 = 3;
 const SETUP_BUDGET: Duration = Duration::from_secs(4);
 const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the worker waits for a command before servicing the socket
+/// (pings, pauses, keymap changes arrive while nobody is typing).
+const IDLE_POLL: Duration = Duration::from_millis(200);
+/// How long a burst reads after its flush, to catch a DISCONNECT the
+/// server sends in response.
+const POST_FLUSH_READ: Duration = Duration::from_millis(20);
 const NAME: &str = "parla";
 /// evdev keycodes are xkb keycodes minus 8
 const EVDEV_OFFSET: u32 = 8;
@@ -165,6 +171,9 @@ struct KeymapData {
     /// xkb keycodes of modifier keys, found by scanning the keymap.
     shift: Option<u32>,
     altgr: Option<u32>,
+    /// Active layout group, from ei_keyboard.modifiers. Lookups resolve
+    /// against it, so a user on the second layout of two gets that one.
+    group: u32,
     char_cache: HashMap<char, CharKeys>,
 }
 
@@ -184,32 +193,46 @@ impl KeymapData {
             keymap,
             shift,
             altgr,
+            group: 0,
             char_cache: HashMap::new(),
         }
     }
 
-    fn find_modifier(keymap: &xkb::Keymap, sym: xkb::Keysym) -> Option<u32> {
-        for kc in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
-            if keymap
-                .key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0)
-                .contains(&sym)
-            {
-                return Some(kc);
-            }
+    fn set_group(&mut self, group: u32) {
+        let group = if group < self.keymap.num_layouts() { group } else { 0 };
+        if group != self.group {
+            self.group = group;
+            self.char_cache.clear();
         }
-        None
     }
 
-    /// Locate the keycode and shift level producing a keysym (layout 0).
+    fn find_modifier(keymap: &xkb::Keymap, sym: xkb::Keysym) -> Option<u32> {
+        (keymap.min_keycode().raw()..=keymap.max_keycode().raw()).find(|&kc| {
+            keymap
+                .key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0)
+                .contains(&sym)
+        })
+    }
+
+    /// Locate the keycode and shift level producing a keysym on the active
+    /// layout group, falling back to group 0 for keys the group lacks.
     fn locate(&self, sym: xkb::Keysym) -> Option<(u32, u32)> {
-        for kc in self.keymap.min_keycode().raw()..=self.keymap.max_keycode().raw() {
-            for level in 0..4u32 {
-                if self
-                    .keymap
-                    .key_get_syms_by_level(xkb::Keycode::new(kc), 0, level)
-                    .contains(&sym)
-                {
-                    return Some((kc, level));
+        let groups: &[u32] = if self.group == 0 { &[0] } else { &[self.group, 0] };
+        for &group in groups {
+            for kc in self.keymap.min_keycode().raw()..=self.keymap.max_keycode().raw() {
+                let key = xkb::Keycode::new(kc);
+                if group >= self.keymap.num_layouts_for_key(key) {
+                    continue;
+                }
+                let levels = self.keymap.num_levels_for_key(key, group).min(4);
+                for level in 0..levels {
+                    if self
+                        .keymap
+                        .key_get_syms_by_level(key, group, level)
+                        .contains(&sym)
+                    {
+                        return Some((kc, level));
+                    }
                 }
             }
         }
@@ -220,7 +243,13 @@ impl KeymapData {
         if let Some(ck) = self.char_cache.get(&c) {
             return Ok(*ck);
         }
-        let sym = xkb::Keysym::from_char(c);
+        let sym = match c {
+            // from_char maps these to Linefeed/Tab-as-control, which no
+            // keymap carries; the keys that produce them do
+            '\n' | '\r' => xkb::Keysym::Return,
+            '\t' => xkb::Keysym::Tab,
+            _ => xkb::Keysym::from_char(c),
+        };
         if sym == xkb::Keysym::NoSymbol {
             return Err(format!("no keysym for char {c:?}"));
         }
@@ -249,6 +278,9 @@ struct Inner {
     last_serial: u32,
     sequence: u32,
     // setup/health state
+    /// OR of every keyboard/text capability mask the seat advertised;
+    /// bound once at seat.done (a later bind replaces the earlier set).
+    capability_mask: u64,
     capability_bound: bool,
     device_done: bool,
     resumed: bool,
@@ -332,15 +364,18 @@ impl Inner {
                 ei::seat::Event::Capability { mask, interface } => {
                     tracing::debug!("EIS seat capability: {interface} (mask {mask})");
                     if interface == "ei_keyboard" || interface == "ei_text" {
-                        seat.bind(mask);
-                        self.capability_bound = true;
+                        self.capability_mask |= mask;
                     }
                 }
                 ei::seat::Event::Done => {
-                    if !self.capability_bound {
+                    if self.capability_mask == 0 {
                         return Err(
                             "KWin seat advertised no keyboard/text capability".into()
                         );
+                    }
+                    if !self.capability_bound {
+                        seat.bind(self.capability_mask);
+                        self.capability_bound = true;
                     }
                 }
                 ei::seat::Event::Device { device } => {
@@ -369,7 +404,8 @@ impl Inner {
                     self.last_serial = serial;
                     self.resumed = true;
                 }
-                ei::device::Event::Paused { .. } => {
+                ei::device::Event::Paused { serial } => {
+                    self.last_serial = serial;
                     self.resumed = false;
                 }
                 // no Removed event in the protocol: device removal arrives as
@@ -395,13 +431,55 @@ impl Inner {
                     }
                     .map_err(|e| format!("keymap fd error: {e}"))?
                     .ok_or("xkb failed to compile the KWin keymap")?;
-                    self.keymap = Some(KeymapData::new(keymap));
+                    let group = self.keymap.as_ref().map_or(0, |k| k.group);
+                    let mut data = KeymapData::new(keymap);
+                    data.set_group(group);
+                    self.keymap = Some(data);
+                }
+                ei::keyboard::Event::Modifiers { serial, group, .. } => {
+                    self.last_serial = serial;
+                    if let Some(k) = self.keymap.as_mut() {
+                        k.set_group(group);
+                    }
                 }
                 _ => {}
             },
             other => tracing::trace!("unhandled EIS event: {other:?}"),
         }
         Ok(())
+    }
+
+    /// Close the current logical event group. One key event per frame:
+    /// press and release of the same key inside one frame is a no-op by
+    /// spec, and the server may drop or disconnect a client that does it.
+    fn frame(&self) {
+        if let Some(d) = &self.device {
+            d.frame(self.last_serial, now_micros());
+        }
+    }
+
+    /// One key event in its own frame.
+    fn key(&self, kb: &ei::Keyboard, xkb_keycode: u32, state: ei::keyboard::KeyState) {
+        kb.key(xkb_keycode - EVDEV_OFFSET, state);
+        self.frame();
+    }
+
+    fn press_release(&self, kb: &ei::Keyboard, xkb_keycode: u32) {
+        self.key(kb, xkb_keycode, ei::keyboard::KeyState::Press);
+        self.key(kb, xkb_keycode, ei::keyboard::KeyState::Released);
+    }
+
+    fn modifier(&self, kb: &ei::Keyboard, keycode: Option<u32>, what: &str, state: ei::keyboard::KeyState) {
+        match keycode {
+            Some(kc) => self.key(kb, kc, state),
+            None => tracing::warn!("{what} not on keymap; char may come out wrong"),
+        }
+    }
+
+    /// One keysym event on the ei_text path, in its own frame.
+    fn keysym(&self, t: &ei::Text, sym: u32, state: ei::keyboard::KeyState) {
+        t.keysym(sym, state);
+        self.frame();
     }
 }
 
@@ -425,7 +503,16 @@ fn worker_main(cmd_rx: mpsc::Receiver<Cmd>, init_tx: mpsc::Sender<Result<(), Str
         }
     }
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    loop {
+        let cmd = match cmd_rx.recv_timeout(IDLE_POLL) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // idle: answer pings, notice pauses/keymap changes/disconnects
+                worker.service();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let (reply, result) = match cmd {
             Cmd::Type(text, reply) => (reply, worker.type_text(&text)),
             Cmd::Chord(chord, reply) => (reply, worker.key_chord(&chord)),
@@ -443,6 +530,18 @@ impl Worker {
             conn: zbus::blocking::Connection::session()?,
             inner: None,
         })
+    }
+
+    /// Drain whatever the server sent while nobody was typing. A dead
+    /// session stays marked dead; the next command reconnects.
+    fn service(&mut self) {
+        if let Some(inner) = self.inner.as_mut() {
+            if !inner.dead {
+                if let Err(e) = inner.pump(Instant::now()) {
+                    tracing::warn!("EIS session lost while idle: {e}");
+                }
+            }
+        }
     }
 
     fn shutdown(&mut self) {
@@ -509,6 +608,7 @@ impl Worker {
             keymap: None,
             last_serial: u32::MAX,
             sequence: 0,
+            capability_mask: 0,
             capability_bound: false,
             device_done: false,
             resumed: false,
@@ -544,9 +644,11 @@ impl Worker {
             }
             self.connect()?;
         }
-        // drain events that arrived since the last call; a PAUSE while idle
-        // must be followed by a fresh RESUMED before we may emulate
+        // drain events that arrived since the last call, whether or not we
+        // looked ready: a PAUSE, keymap change or DISCONNECT that landed
+        // while idle changes what we may do next
         let inner = self.inner.as_mut().expect("session set by connect()");
+        inner.pump(Instant::now()).map_err(anyhow::Error::msg)?;
         let deadline = Instant::now() + Duration::from_millis(800);
         while !inner.is_ready() && !inner.dead && Instant::now() < deadline {
             inner
@@ -577,9 +679,12 @@ impl Worker {
         device.start_emulating(inner.last_serial, inner.sequence);
         inner.sequence += 1;
         let result = send(inner);
-        device.frame(inner.last_serial, now_micros());
         device.stop_emulating(inner.last_serial);
         inner.context.flush()?;
+        // read back: a protocol complaint arrives as DISCONNECT right away
+        inner
+            .pump(Instant::now() + POST_FLUSH_READ)
+            .map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             !inner.dead,
             "EIS session died mid-burst; text may not have landed"
@@ -590,13 +695,14 @@ impl Worker {
     fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
         let chars: Vec<char> = text.chars().collect();
         self.burst(move |inner| {
-            if let Some(t) = &inner.text {
+            if let Some(t) = inner.text.clone() {
                 // layout-independent UTF-8 path (KWin with ei_text support)
                 let s: String = chars.into_iter().collect();
                 let mut start = 0;
                 while start < s.len() {
                     let end = floor_char_boundary(&s, start + 2048);
                     t.utf8(&s[start..end]);
+                    inner.frame();
                     start = end;
                 }
             } else {
@@ -610,35 +716,50 @@ impl Worker {
                     .ok_or_else(|| anyhow::anyhow!("no EIS keymap"))?;
                 let shift = keymap.shift;
                 let altgr = keymap.altgr;
+                // resolve first: char_keys needs &mut for its cache, the
+                // key helpers need &Inner
+                let resolved: Vec<(char, Result<CharKeys, String>)> =
+                    chars.iter().map(|&c| (c, keymap.char_keys(c))).collect();
                 let mut skipped = Vec::new();
-                for &c in &chars {
-                    let Ok(ck) = keymap.char_keys(c) else {
+                let mut typed = 0usize;
+                use ei::keyboard::KeyState::{Press, Released};
+                for (c, res) in resolved {
+                    let Ok(ck) = res else {
                         // char not reachable on the active layout (emoji,
-                        // accented letters on US, ...): skip, don't abort —
-                        // losing one glyph beats losing the whole utterance
-                        tracing::warn!("char {c:?} not on active keymap; skipped");
+                        // accented letters on US, ...): type the rest and
+                        // report it — losing one glyph beats losing the
+                        // whole utterance, silently losing it is worse
                         skipped.push(c);
                         continue;
                     };
                     if ck.shift {
-                        press(&keyboard, shift, "Shift");
+                        inner.modifier(&keyboard, shift, "Shift", Press);
                     }
                     if ck.altgr {
-                        press(&keyboard, altgr, "AltGr");
+                        inner.modifier(&keyboard, altgr, "AltGr", Press);
                     }
-                    keyboard.key(ck.keycode - EVDEV_OFFSET, ei::keyboard::KeyState::Press);
-                    keyboard.key(ck.keycode - EVDEV_OFFSET, ei::keyboard::KeyState::Released);
+                    inner.press_release(&keyboard, ck.keycode);
                     if ck.altgr {
-                        release(&keyboard, altgr);
+                        inner.modifier(&keyboard, altgr, "AltGr", Released);
                     }
                     if ck.shift {
-                        release(&keyboard, shift);
+                        inner.modifier(&keyboard, shift, "Shift", Released);
                     }
+                    typed += 1;
                 }
-                anyhow::ensure!(
-                    skipped.len() < chars.len(),
-                    "no characters typeable on the active keymap"
-                );
+                if !skipped.is_empty() {
+                    let mut missing: Vec<char> = skipped;
+                    missing.dedup();
+                    anyhow::bail!(
+                        "typed {typed} of {} chars; not on the active keymap: {}",
+                        chars.len(),
+                        missing
+                            .iter()
+                            .map(|c| format!("{c:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
             }
             Ok(())
         })
@@ -648,7 +769,8 @@ impl Worker {
         let keys = normalize_chord(chord);
         anyhow::ensure!(!keys.is_empty(), "empty key chord");
         self.burst(move |inner| {
-            if let Some(t) = &inner.text {
+            use ei::keyboard::KeyState::{Press, Released};
+            if let Some(t) = inner.text.clone() {
                 // keysym path: server resolves against the active layout
                 let syms: Vec<u32> = keys
                     .iter()
@@ -656,14 +778,14 @@ impl Worker {
                     .collect::<anyhow::Result<_>>()?;
                 let (mods, main) = syms.split_at(syms.len() - 1);
                 for &m in mods {
-                    t.keysym(m, ei::keyboard::KeyState::Press);
+                    inner.keysym(&t, m, Press);
                 }
                 for &m in main {
-                    t.keysym(m, ei::keyboard::KeyState::Press);
-                    t.keysym(m, ei::keyboard::KeyState::Released);
+                    inner.keysym(&t, m, Press);
+                    inner.keysym(&t, m, Released);
                 }
                 for &m in mods.iter().rev() {
-                    t.keysym(m, ei::keyboard::KeyState::Released);
+                    inner.keysym(&t, m, Released);
                 }
                 return Ok(());
             }
@@ -686,14 +808,13 @@ impl Worker {
             }
             let (mods, main) = keycodes.split_at(keycodes.len() - 1);
             for &kc in mods {
-                keyboard.key(kc - EVDEV_OFFSET, ei::keyboard::KeyState::Press);
+                inner.key(&keyboard, kc, Press);
             }
             for &kc in main {
-                keyboard.key(kc - EVDEV_OFFSET, ei::keyboard::KeyState::Press);
-                keyboard.key(kc - EVDEV_OFFSET, ei::keyboard::KeyState::Released);
+                inner.press_release(&keyboard, kc);
             }
             for &kc in mods.iter().rev() {
-                keyboard.key(kc - EVDEV_OFFSET, ei::keyboard::KeyState::Released);
+                inner.key(&keyboard, kc, Released);
             }
             Ok(())
         })
@@ -714,20 +835,6 @@ impl Worker {
     }
 }
 
-fn press(kb: &ei::Keyboard, keycode: Option<u32>, what: &str) {
-    if let Some(kc) = keycode {
-        kb.key(kc - EVDEV_OFFSET, ei::keyboard::KeyState::Press);
-    } else {
-        tracing::warn!("{what} not on keymap; char may come out wrong");
-    }
-}
-
-fn release(kb: &ei::Keyboard, keycode: Option<u32>) {
-    if let Some(kc) = keycode {
-        kb.key(kc - EVDEV_OFFSET, ei::keyboard::KeyState::Released);
-    }
-}
-
 fn floor_char_boundary(s: &str, bound: usize) -> usize {
     if bound >= s.len() {
         return s.len();
@@ -739,11 +846,18 @@ fn floor_char_boundary(s: &str, bound: usize) -> usize {
     b
 }
 
+/// Frame timestamps are CLOCK_MONOTONIC microseconds by protocol.
 fn now_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes into a valid, properly aligned timespec
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    if rc != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
 }
 
 /// Chord key name → X11 keysym. Used for both the ei_text.keysym path and

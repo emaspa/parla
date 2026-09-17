@@ -4,6 +4,7 @@ description = "Fast-path voice command grammar for parla: intent parsing, .deskt
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }

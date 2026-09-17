@@ -4,6 +4,7 @@ description = "parla daemon: PipeWire capture, Silero VAD, whisper.cpp ASR, PTT 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "parlad"

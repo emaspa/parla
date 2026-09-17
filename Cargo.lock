@@ -1081,6 +1081,7 @@ dependencies = [
  "cpal",
  "desktopd",
  "futures-util",
+ "libc",
  "parla-grammar",
  "reqwest",
  "serde",

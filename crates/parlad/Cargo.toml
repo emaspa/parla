@@ -1,6 +1,6 @@
 [package]
 name = "parlad"
-description = "parla daemon: PipeWire capture, Silero VAD, whisper.cpp ASR, PTT hotkeys, router, tray"
+description = "parla daemon: PipeWire capture, energy-gated VAD, whisper.cpp ASR, PTT hotkeys, router"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -26,3 +26,4 @@ cpal = "0.15"
 futures-util = "0.3.34"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
+libc = "0.2"

@@ -18,7 +18,7 @@ pub fn rms(samples: &[f32]) -> f32 {
 /// brief dip mid-speech doesn't cut words.
 pub fn trim_silence(samples: &[f32], rate: u32, threshold: f32) -> Vec<f32> {
     let frame = (rate as usize * 30 / 1000).max(1);
-    let frames: Vec<f32> = samples.chunks(frame).map(|c| rms(c)).collect();
+    let frames: Vec<f32> = samples.chunks(frame).map(rms).collect();
     let first = frames.iter().position(|&r| r >= threshold);
     let last = frames.iter().rposition(|&r| r >= threshold);
     match (first, last) {

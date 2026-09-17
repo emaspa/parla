@@ -41,12 +41,22 @@ pub enum Intent {
 }
 
 impl Intent {
-    /// Destructive intents require spoken confirmation before execution
-    /// (plan §5: voice is an unauthenticated input channel).
+    /// Intents that always require spoken confirmation before execution
+    /// (plan §5: voice is an unauthenticated input channel), whatever any
+    /// judged risk score says.
+    ///
+    /// - `CloseWindow` can discard unsaved state.
+    /// - `RunShortcut` fires an arbitrary global shortcut.
+    /// - `Key` injects an arbitrary chord into whatever has focus.
+    /// - `ClaudeTell` sends text plus Enter to a running agent, which then
+    ///   acts on it.
     pub fn needs_confirmation(&self) -> bool {
         matches!(
             self,
-            Intent::CloseWindow { .. } | Intent::RunShortcut { .. }
+            Intent::CloseWindow { .. }
+                | Intent::RunShortcut { .. }
+                | Intent::Key { .. }
+                | Intent::ClaudeTell { .. }
         )
     }
 

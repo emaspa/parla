@@ -79,3 +79,17 @@ pub fn normalize_chord(chord: &str) -> Vec<String> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_chord;
+
+    #[test]
+    fn chord_normalization() {
+        assert_eq!(normalize_chord("Ctrl S"), vec!["ctrl", "s"]);
+        assert_eq!(normalize_chord("control+shift+Return"), vec!["ctrl", "shift", "enter"]);
+        assert_eq!(normalize_chord("Super  Esc"), vec!["meta", "escape"]);
+        assert_eq!(normalize_chord("win+del"), vec!["meta", "delete"]);
+        assert_eq!(normalize_chord("  +  "), Vec::<String>::new());
+    }
+}

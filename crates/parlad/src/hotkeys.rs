@@ -6,6 +6,9 @@
 //! subscribe to org.kde.kglobalaccel.Component.globalShortcut{Pressed,Released}
 //! on /component/parla. The Released signal is what makes hold-to-talk work
 //! without evdev hacks.
+//!
+//! The signal loop's channel closing means the daemon is deaf; `run` treats
+//! that as fatal so systemd restarts it.
 
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -125,8 +128,11 @@ impl HotkeyManager {
         let command_key = parse_chord(command_chord)
             .with_context(|| format!("bad command chord {command_chord:?}"))?;
 
-        for (action, key) in [(ACTION_DICTATE, dictate_key), (ACTION_COMMAND, command_key)] {
-            Self::register_action(&conn, action, key).await?;
+        for (action, chord, key) in [
+            (ACTION_DICTATE, dictate_chord, dictate_key),
+            (ACTION_COMMAND, command_chord, command_key),
+        ] {
+            Self::register_action(&conn, action, chord, key).await?;
         }
 
         let (tx, rx) = mpsc::channel(32);
@@ -140,7 +146,12 @@ impl HotkeyManager {
         Ok((Self { conn }, rx))
     }
 
-    async fn register_action(conn: &Connection, action: &str, key: u32) -> anyhow::Result<()> {
+    async fn register_action(
+        conn: &Connection,
+        action: &str,
+        chord: &str,
+        key: u32,
+    ) -> anyhow::Result<()> {
         let action_id = action_id(action);
         // idempotent restart: drop any stale registration first
         let _ = conn
@@ -162,20 +173,43 @@ impl HotkeyManager {
         .await
         .with_context(|| format!("doRegister({action}) failed"))?;
 
-        // setShortcut(actionId as, keys ai, flags u) — single QKeySequence as
-        // signed Qt key ints. (setShortcutKeys wants a(ai), an array of
-        // structs; the singular form is the simpler wire shape.)
+        // setShortcut(actionId as, keys ai, flags u) -> ai — single
+        // QKeySequence as signed Qt key ints. (setShortcutKeys wants a(ai),
+        // an array of structs; the singular form is the simpler wire shape.)
+        // The reply is what kglobalaccel actually bound: empty or different
+        // when another component already owns the chord.
         let keys: Vec<i32> = vec![key as i32];
-        conn.call_method(
-            Some(SERVICE),
-            MAIN_PATH,
-            Some(MAIN_IFACE),
-            "setShortcut",
-            &(&action_id, &keys, 0u32),
-        )
-        .await
-        .with_context(|| format!("setShortcut({action}) failed"))?;
-        tracing::info!("registered hotkey {action} (qt key 0x{key:08x})");
+        let reply = conn
+            .call_method(
+                Some(SERVICE),
+                MAIN_PATH,
+                Some(MAIN_IFACE),
+                "setShortcut",
+                &(&action_id, &keys, 0u32),
+            )
+            .await
+            .with_context(|| format!("setShortcut({action}) failed"))?;
+        let bound: Vec<i32> = reply
+            .body()
+            .deserialize()
+            .with_context(|| format!("setShortcut({action}) returned an unexpected reply"))?;
+        if bound != keys {
+            let _ = conn
+                .call_method(
+                    Some(SERVICE),
+                    MAIN_PATH,
+                    Some(MAIN_IFACE),
+                    "unRegister",
+                    &(&action_id),
+                )
+                .await;
+            anyhow::bail!(
+                "hotkey {chord:?} for {action} is taken by another shortcut \
+                 (kglobalaccel bound {bound:?} instead of {keys:?}); \
+                 pick a different chord in [hotkeys] or free it in System Settings"
+            );
+        }
+        tracing::info!("registered hotkey {action} = {chord} (qt key 0x{key:08x})");
         Ok(())
     }
 
@@ -196,61 +230,61 @@ impl HotkeyManager {
     }
 }
 
+/// Forward press/release signals until the bus stream ends. One match rule
+/// (no member) so presses and releases share a single ordered stream; a
+/// signal that fails to decode is logged and skipped, never fatal.
 async fn signal_loop(conn: &Connection, tx: mpsc::Sender<HotkeyEvent>) -> anyhow::Result<()> {
-    let pressed = MessageStream::for_match_rule(
+    let mut stream = MessageStream::for_match_rule(
         MatchRule::builder()
             .msg_type(MessageType::Signal)
             .sender(SERVICE)?
             .path(COMPONENT_PATH)?
             .interface(COMPONENT_IFACE)?
-            .member("globalShortcutPressed")?
             .build(),
         conn,
         None,
     )
     .await?;
-    let released = MessageStream::for_match_rule(
-        MatchRule::builder()
-            .msg_type(MessageType::Signal)
-            .sender(SERVICE)?
-            .path(COMPONENT_PATH)?
-            .interface(COMPONENT_IFACE)?
-            .member("globalShortcutReleased")?
-            .build(),
-        conn,
-        None,
-    )
-    .await?;
-    tokio::pin!(pressed);
-    tokio::pin!(released);
-    loop {
-        tokio::select! {
-            msg = pressed.next() => deliver(msg, true, &tx).await?,
-            msg = released.next() => deliver(msg, false, &tx).await?,
+    while let Some(msg) = stream.next().await {
+        let msg = msg.context("hotkey signal stream failed")?;
+        match decode(&msg) {
+            Ok(Some(event)) => {
+                tracing::debug!("hotkey {event:?}");
+                if tx.send(event).await.is_err() {
+                    // main loop gone: nothing left to notify
+                    return Ok(());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("ignoring undecodable kglobalaccel signal: {e:#}"),
         }
     }
+    anyhow::bail!("hotkey signal stream ended")
 }
 
-async fn deliver(
-    msg: Option<zbus::Result<zbus::Message>>,
-    pressed: bool,
-    tx: &mpsc::Sender<HotkeyEvent>,
-) -> anyhow::Result<()> {
-    let msg = msg.context("hotkey signal stream ended")??;
-    let (component, action, _timestamp): (String, String, i64) = msg.body().deserialize()?;
-    if component != COMPONENT {
-        return Ok(());
-    }
-    let event = match (action.as_str(), pressed) {
-        (ACTION_DICTATE, true) => HotkeyEvent::DictatePressed,
-        (ACTION_DICTATE, false) => HotkeyEvent::DictateReleased,
-        (ACTION_COMMAND, true) => HotkeyEvent::CommandPressed,
-        (ACTION_COMMAND, false) => HotkeyEvent::CommandReleased,
-        _ => return Ok(()),
+/// Map one Component signal to an event; None for other members, other
+/// components, or actions that are not ours.
+fn decode(msg: &zbus::Message) -> anyhow::Result<Option<HotkeyEvent>> {
+    let header = msg.header();
+    let pressed = match header.member().map(|m| m.as_str()) {
+        Some("globalShortcutPressed") => true,
+        Some("globalShortcutReleased") => false,
+        _ => return Ok(None),
     };
-    tracing::debug!("hotkey {event:?}");
-    tx.send(event).await?;
-    Ok(())
+    let (component, action, _timestamp): (String, String, i64) = msg
+        .body()
+        .deserialize()
+        .context("globalShortcut{Pressed,Released} body")?;
+    if component != COMPONENT {
+        return Ok(None);
+    }
+    Ok(match (action.as_str(), pressed) {
+        (ACTION_DICTATE, true) => Some(HotkeyEvent::DictatePressed),
+        (ACTION_DICTATE, false) => Some(HotkeyEvent::DictateReleased),
+        (ACTION_COMMAND, true) => Some(HotkeyEvent::CommandPressed),
+        (ACTION_COMMAND, false) => Some(HotkeyEvent::CommandReleased),
+        _ => None,
+    })
 }
 
 // kglobalaccel drops our component automatically when our bus name

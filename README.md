@@ -70,7 +70,10 @@ Measured on a 123-application, 12-window desktop:
 
 The path is off by default. Turn it on with `enabled = true` under
 `[typesafe]` and export `TYPESAFE_API_KEY`. parlad reads the key from the
-environment ahead of the config file, so it never has to touch disk.
+environment ahead of the config file, so it never has to touch disk. The
+request carries the utterance, the installed application names, and for each
+open window its application and an index. Window titles stay on this machine
+unless `send_window_titles = true`.
 
 ```
 parlad --judge "bring the file manager to the front"

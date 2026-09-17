@@ -62,6 +62,11 @@ pub struct TypeSafeConfig {
     pub dictation_threshold: f64,
     /// `is_destructive` at or above this forces spoken confirmation.
     pub destructive_threshold: f64,
+    /// Include window titles in what the judged path sends to the API. Off by
+    /// default: titles carry document names, URLs and chat subjects, so the
+    /// request then names only each window's application and an index, and
+    /// the title is mapped back on this machine.
+    pub send_window_titles: bool,
 }
 
 impl Default for TypeSafeConfig {
@@ -78,6 +83,7 @@ impl Default for TypeSafeConfig {
             act_unconfirmed_above: 0.75,
             dictation_threshold: 0.5,
             destructive_threshold: 0.6,
+            send_window_titles: false,
         }
     }
 }

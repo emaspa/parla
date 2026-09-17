@@ -128,8 +128,8 @@ impl Command {
             Command::OpenTerminal => "open a terminal".into(),
             Command::Window { op, target } => {
                 let what = match (window_title, target) {
-                    (Some(title), _) => format!("{title:?}"),
-                    (None, WindowTarget::Query(q)) => format!("the window matching {q:?}"),
+                    (Some(title), _) => format!("'{title}'"),
+                    (None, WindowTarget::Query(q)) => format!("the window matching '{q}'"),
                     (None, WindowTarget::Id(id)) => format!("window {id}"),
                     (None, WindowTarget::Focused) => "the focused window".into(),
                 };
@@ -180,9 +180,9 @@ mod tests {
         };
         assert_eq!(
             c.describe(Some("build — Konsole")),
-            "close \"build — Konsole\""
+            "close 'build — Konsole'"
         );
-        assert_eq!(c.describe(None), "close the window matching \"konsole\"");
+        assert_eq!(c.describe(None), "close the window matching 'konsole'");
         assert_eq!(
             Command::Key {
                 chord: "ctrl s".into()

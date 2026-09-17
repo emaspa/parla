@@ -9,6 +9,7 @@ mod asr;
 mod audio;
 mod command;
 mod config;
+mod confirm;
 mod cues;
 mod hotkeys;
 mod instance;
@@ -33,7 +34,7 @@ use config::DaemonConfig;
 use desktopd::Executor;
 use hotkeys::{HotkeyEvent, HotkeyManager};
 use parla_grammar::Grammar;
-use router::{Mode, Router};
+use router::{Handled, Mode, Router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -118,6 +119,7 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&executor),
         Arc::clone(&grammar),
         judge,
+        Duration::from_millis(cfg.router.confirm_window_ms),
     ));
 
     // One worker handles utterances in release order, so two quick
@@ -346,11 +348,20 @@ async fn worker(
     while let Some(Job { mode, samples }) = jobs.recv().await {
         let outcome = process(samples, &cfg.audio, &asr, &router, &lock_rx, mode).await;
         match outcome {
-            Ok(Outcome::Done(msg)) => {
+            Ok(Outcome::Handled(Handled::Done(msg))) => {
                 tracing::info!("{mode:?} done: {msg}");
                 if cfg.router.notify_results {
                     notify("parla", &msg);
                 }
+            }
+            Ok(Outcome::Handled(Handled::Confirm(question))) => {
+                // The user has to hear this one whatever notify_results
+                // says: the action is waiting on their answer.
+                tracing::info!("{mode:?} waiting: {question}");
+                if cfg.router.cues {
+                    cues::play(cues::Cue::Stop);
+                }
+                notify("parla", &question);
             }
             Ok(Outcome::Locked) => {
                 tracing::info!("session locked; discarding transcribed {mode:?} utterance");
@@ -372,7 +383,7 @@ async fn worker(
 }
 
 enum Outcome {
-    Done(String),
+    Handled(Handled),
     /// The session locked before anything was injected or executed.
     Locked,
 }
@@ -401,7 +412,10 @@ async fn process(
     if *lock_rx.borrow() {
         return Ok(Outcome::Locked);
     }
-    router.handle(mode, &transcript).await.map(Outcome::Done)
+    router
+        .handle(mode, &transcript)
+        .await
+        .map(Outcome::Handled)
 }
 
 fn samples_for_ms(ms: u64) -> usize {
@@ -459,6 +473,7 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
         Arc::clone(&executor),
         Arc::new(grammar),
         Some(Arc::clone(&judge)),
+        Duration::from_millis(cfg.router.confirm_window_ms),
     );
     let snapshot = router.snapshot().await?;
     let index = executor.desktop_index();
@@ -480,7 +495,7 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
             println!("judged:    {:?}", resolved.intent);
             println!("confidence: {:.2}", resolved.confidence);
             let decision = router.policy().decide(&resolved.intent, &resolved.signals);
-            let command = command::from_resolved(resolved);
+            let command = command::from_resolved(resolved).context("judge produced a reply")?;
             println!("command:   {command:?}");
             match decision {
                 policy::Decision::Act => println!("would execute immediately"),

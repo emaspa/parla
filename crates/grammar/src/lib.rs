@@ -193,6 +193,17 @@ mod tests {
     }
 
     #[test]
+    fn confirm_and_deny_are_whole_utterances() {
+        assert_eq!(parse("Yes."), Some(Intent::Confirm));
+        assert_eq!(parse("go ahead"), Some(Intent::Confirm));
+        assert_eq!(parse("No"), Some(Intent::Deny));
+        assert_eq!(parse("never mind"), Some(Intent::Deny));
+        // "yes" inside a longer sentence is not a reply
+        assert_eq!(parse("yes open firefox"), None);
+        assert!(!Intent::Confirm.needs_confirmation());
+    }
+
+    #[test]
     fn fallthrough_is_none() {
         assert_eq!(parse("open my email and find the message from alan"), None);
         assert_eq!(parse("what's the weather"), None);

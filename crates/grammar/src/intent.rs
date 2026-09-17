@@ -38,6 +38,10 @@ pub enum Intent {
     Notify { text: String },
     /// Send a raw key chord to the focused window (e.g. "ctrl s").
     Key { chord: String },
+    /// "yes": carry out the action the router is waiting to confirm.
+    Confirm,
+    /// "no": drop the action the router is waiting to confirm.
+    Deny,
 }
 
 impl Intent {
@@ -85,6 +89,8 @@ impl Intent {
             "claude_read" => Intent::ClaudeRead,
             "notify" => Intent::Notify { text: get("text")? },
             "key" => Intent::Key { chord: get("chord")? },
+            "confirm" => Intent::Confirm,
+            "deny" => Intent::Deny,
             _ => {
                 tracing::warn!("unknown intent name in rule: {name}");
                 return None;

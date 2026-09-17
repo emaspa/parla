@@ -152,6 +152,8 @@ fn intent_name(intent: &Intent) -> &'static str {
         Intent::ClaudeRead => "claude_read",
         Intent::Notify { .. } => "notify",
         Intent::Key { .. } => "key",
+        Intent::Confirm => "confirm",
+        Intent::Deny => "deny",
     }
 }
 

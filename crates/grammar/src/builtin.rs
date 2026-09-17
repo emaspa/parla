@@ -12,6 +12,20 @@ type RuleRow = (&'static str, &'static str, Option<usize>);
 /// priority: earlier rules win, so specific phrases ("start claude") must
 /// precede generic captures ("start {query}").
 const RULES: &[RuleRow] = &[
+    // replies to a confirmation prompt; the router checks these first
+    ("yes", "confirm", None),
+    ("yes please", "confirm", None),
+    ("yeah", "confirm", None),
+    ("yep", "confirm", None),
+    ("confirm", "confirm", None),
+    ("do it", "confirm", None),
+    ("go ahead", "confirm", None),
+    ("no", "deny", None),
+    ("nope", "deny", None),
+    ("cancel", "deny", None),
+    ("stop", "deny", None),
+    ("never mind", "deny", None),
+    ("nevermind", "deny", None),
     // terminal
     ("open terminal", "open_terminal", None),
     ("open konsole", "open_terminal", None),

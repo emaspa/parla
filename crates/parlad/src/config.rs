@@ -156,6 +156,9 @@ pub struct RouterConfig {
     pub cues: bool,
     /// Show a notification with the action result.
     pub notify_results: bool,
+    /// How long a "say yes" prompt stays answerable. A confirmation after
+    /// this is refused and the action has to be spoken again.
+    pub confirm_window_ms: u64,
 }
 
 impl Default for HotkeyConfig {
@@ -202,6 +205,7 @@ impl Default for RouterConfig {
             grammar_file: None,
             cues: true,
             notify_results: true,
+            confirm_window_ms: 8_000,
         }
     }
 }
@@ -250,6 +254,10 @@ impl DaemonConfig {
         );
 
         anyhow::ensure!(self.asr.threads > 0, "asr.threads must be > 0");
+        anyhow::ensure!(
+            self.router.confirm_window_ms > 0,
+            "router.confirm_window_ms must be > 0"
+        );
         anyhow::ensure!(
             !self.asr.language.trim().is_empty(),
             "asr.language must be a language code or \"auto\""
@@ -330,6 +338,9 @@ mod tests {
         assert!(c.validate().is_err());
         let mut c = DaemonConfig::default();
         c.audio.max_hold_ms = 0;
+        assert!(c.validate().is_err());
+        let mut c = DaemonConfig::default();
+        c.router.confirm_window_ms = 0;
         assert!(c.validate().is_err());
     }
 

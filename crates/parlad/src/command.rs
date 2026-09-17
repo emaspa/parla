@@ -12,15 +12,16 @@ use parla_grammar::Intent;
 
 use crate::judge::Resolved;
 
-/// The command a grammar intent asks for. Window queries keep the executor's
-/// convention that an empty query, or the bare word "window", means the
-/// focused window.
-pub fn from_intent(intent: Intent) -> Command {
+/// The command a grammar intent asks for, or None for the replies
+/// (`Confirm`, `Deny`) that address the router rather than the desktop.
+/// Window queries keep the executor's convention that an empty query, or
+/// the bare word "window", means the focused window.
+pub fn from_intent(intent: Intent) -> Option<Command> {
     let window = |op, query: Option<String>| Command::Window {
         op,
         target: WindowTarget::from_query(query.as_deref()),
     };
-    match intent {
+    Some(match intent {
         Intent::LaunchApp { query } => Command::LaunchApp {
             app: AppTarget::Query(query),
         },
@@ -39,21 +40,22 @@ pub fn from_intent(intent: Intent) -> Command {
         Intent::ClaudeRead => Command::ClaudeRead,
         Intent::Notify { text } => Command::Notify { text },
         Intent::Key { chord } => Command::Key { chord },
-    }
+        Intent::Confirm | Intent::Deny => return None,
+    })
 }
 
 /// The command a judged intent asks for. Where the judge picked a window or
 /// an application from the observed state, the command addresses it by id;
 /// the title or name in the intent was only ever a label for that choice.
-pub fn from_resolved(resolved: Resolved) -> Command {
+pub fn from_resolved(resolved: Resolved) -> Option<Command> {
     let Resolved {
         intent,
         window_id,
         entry_id,
         ..
     } = resolved;
-    let command = from_intent(intent);
-    match (command, window_id, entry_id) {
+    let command = from_intent(intent)?;
+    Some(match (command, window_id, entry_id) {
         (Command::Window { op, .. }, Some(id), _) => Command::Window {
             op,
             target: WindowTarget::Id(id),
@@ -62,7 +64,7 @@ pub fn from_resolved(resolved: Resolved) -> Command {
             app: AppTarget::Entry(id),
         },
         (command, _, _) => command,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -87,10 +89,10 @@ mod tests {
         };
         assert_eq!(
             from_resolved(resolved(close.clone(), Some("{k1}"), None)),
-            Command::Window {
+            Some(Command::Window {
                 op: WindowOp::Close,
                 target: WindowTarget::Id("{k1}".into())
-            }
+            })
         );
         // An app chosen from the index launches by its .desktop id, and a
         // window id that the judge did not produce leaves the query alone.
@@ -102,16 +104,16 @@ mod tests {
                 None,
                 Some("firefox.desktop")
             )),
-            Command::LaunchApp {
+            Some(Command::LaunchApp {
                 app: AppTarget::Entry("firefox.desktop".into())
-            }
+            })
         );
         assert_eq!(
             from_resolved(resolved(close, None, None)),
-            Command::Window {
+            Some(Command::Window {
                 op: WindowOp::Close,
                 target: WindowTarget::Query("build — Konsole".into())
-            }
+            })
         );
     }
 
@@ -119,27 +121,29 @@ mod tests {
     fn window_queries_keep_the_executor_convention() {
         assert_eq!(
             from_intent(Intent::CloseWindow { query: None }),
-            Command::Window {
+            Some(Command::Window {
                 op: WindowOp::Close,
                 target: WindowTarget::Focused
-            }
+            })
         );
         assert_eq!(
             from_intent(Intent::FocusWindow {
                 query: "kate".into()
             }),
-            Command::Window {
+            Some(Command::Window {
                 op: WindowOp::Focus,
                 target: WindowTarget::Query("kate".into())
-            }
+            })
         );
         assert_eq!(
             from_intent(Intent::LaunchApp {
                 query: "firefox".into()
             }),
-            Command::LaunchApp {
+            Some(Command::LaunchApp {
                 app: AppTarget::Query("firefox".into())
-            }
+            })
         );
+        assert_eq!(from_intent(Intent::Confirm), None);
+        assert_eq!(from_intent(Intent::Deny), None);
     }
 }

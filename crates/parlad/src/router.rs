@@ -1,14 +1,17 @@
 //! The router: dictation commits straight to the focused window; commands go
 //! through the fast-path grammar first and fall through to the judged path.
-//! Both paths end in the same [`Policy`] decision.
+//! Both paths end in the same [`Policy`] decision, and what the policy wants
+//! confirmed waits in [`Confirmations`] for the next command-mode utterance.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use desktopd::{DesktopIndex, Executor, Window};
+use desktopd::{Command, DesktopIndex, Executor, Window, WindowTarget};
 use parla_grammar::{Grammar, Intent};
 
 use crate::command::{from_intent, from_resolved};
+use crate::confirm::{check_target, Confirmations, Pending, Taken};
 use crate::judge::{Context, Judge, Verdict};
 use crate::policy::{Decision, Policy, Signals};
 
@@ -43,18 +46,35 @@ impl Snapshot {
     }
 }
 
+/// What handling an utterance came to. `Done` is a result to report;
+/// `Confirm` is a question the user has to answer by voice, so the caller
+/// should make sure it is heard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handled {
+    Done(String),
+    Confirm(String),
+}
+
 pub struct Router {
     executor: Arc<Executor>,
     grammar: Arc<Grammar>,
     judge: Option<Arc<Judge>>,
     policy: Policy,
+    pending: Confirmations,
+    /// How long a confirmation prompt stays answerable.
+    confirm_window: Duration,
 }
 
 impl Router {
     /// The policy comes from the judge's config when there is one, so both
     /// paths share thresholds. Without a judge only grammar matches reach
     /// the gate, and those need no threshold.
-    pub fn new(executor: Arc<Executor>, grammar: Arc<Grammar>, judge: Option<Arc<Judge>>) -> Self {
+    pub fn new(
+        executor: Arc<Executor>,
+        grammar: Arc<Grammar>,
+        judge: Option<Arc<Judge>>,
+        confirm_window: Duration,
+    ) -> Self {
         let policy = judge
             .as_ref()
             .map_or_else(Policy::default, |j| j.policy().clone());
@@ -63,6 +83,8 @@ impl Router {
             grammar,
             judge,
             policy,
+            pending: Confirmations::default(),
+            confirm_window,
         }
     }
 
@@ -73,11 +95,12 @@ impl Router {
 
     /// Handle a finished transcript. Returns a short human-readable result
     /// (used for notification/TTS); Err for failures.
-    pub async fn handle(&self, mode: Mode, transcript: &str) -> anyhow::Result<String> {
+    pub async fn handle(&self, mode: Mode, transcript: &str) -> anyhow::Result<Handled> {
         let transcript = transcript.trim();
         anyhow::ensure!(!transcript.is_empty(), "empty transcript");
         match mode {
-            Mode::Dictate => self.executor.type_text(transcript).await,
+            // Dictation is not an answer: a pending prompt survives it.
+            Mode::Dictate => self.executor.type_text(transcript).await.map(Handled::Done),
             Mode::Command => self.route_command(transcript).await,
         }
     }
@@ -105,13 +128,32 @@ impl Router {
         })
     }
 
-    async fn route_command(&self, transcript: &str) -> anyhow::Result<String> {
-        if let Some(intent) = self.grammar.parse(transcript) {
-            self.gate("fast path", &intent, &Signals::Grammar)?;
+    async fn route_command(&self, transcript: &str) -> anyhow::Result<Handled> {
+        let intent = self.grammar.parse(transcript);
+        // A reply is checked before anything else, so "yes" can never be
+        // read as a command; any other command-mode utterance drops the
+        // prompt, since the user has moved on.
+        match intent {
+            Some(Intent::Confirm) => return self.confirm().await,
+            Some(Intent::Deny) => {
+                return Ok(Handled::Done(match self.pending.cancel() {
+                    Some(p) => format!("cancelled: {}", p.describe),
+                    None => "nothing to cancel".into(),
+                }))
+            }
+            _ => {
+                if let Some(p) = self.pending.cancel() {
+                    tracing::info!("dropped unconfirmed {}: new command spoken", p.describe);
+                }
+            }
+        }
+
+        if let Some(intent) = intent {
             tracing::info!("fast path: {intent:?}");
+            let command = from_intent(intent.clone())
+                .context("grammar produced a reply where a command was expected")?;
             return self
-                .executor
-                .execute(from_intent(intent))
+                .dispatch("fast path", &intent, &Signals::Grammar, command)
                 .await;
         }
 
@@ -123,7 +165,7 @@ impl Router {
         self.route_judged(judge, transcript).await
     }
 
-    async fn route_judged(&self, judge: &Judge, transcript: &str) -> anyhow::Result<String> {
+    async fn route_judged(&self, judge: &Judge, transcript: &str) -> anyhow::Result<Handled> {
         // Observed facts the judgment needs. Gathered here rather than inside
         // the judge so the judge stays a pure function of the state it is
         // given, and so a failure to observe is a router error, not a fact.
@@ -132,20 +174,18 @@ impl Router {
 
         match judge.judge_verdict(transcript, &ctx).await? {
             Verdict::Act(resolved) => {
-                self.gate(
-                    &format!("judged (confidence {:.2})", resolved.confidence),
-                    &resolved.intent,
-                    &resolved.signals,
-                )?;
                 tracing::info!(
                     "judged path: {:?} (confidence {:.2}, window {:?})",
                     resolved.intent,
                     resolved.confidence,
                     resolved.window_id
                 );
-                self.executor
-                    .execute(from_resolved(resolved))
-                    .await
+                let source = format!("judged (confidence {:.2})", resolved.confidence);
+                let intent = resolved.intent.clone();
+                let signals = resolved.signals.clone();
+                let command =
+                    from_resolved(resolved).context("judge produced a reply, not a command")?;
+                self.dispatch(&source, &intent, &signals, command).await
             }
             Verdict::Dictation => {
                 anyhow::bail!(
@@ -158,17 +198,78 @@ impl Router {
         }
     }
 
-    /// The single confirmation gate. Voice is an unauthenticated input
-    /// channel, so nothing the policy wants confirmed runs unconfirmed; until
-    /// the spoken-confirm flow lands (P2) that means refusing loudly.
-    fn gate(&self, source: &str, intent: &Intent, signals: &Signals) -> anyhow::Result<()> {
+    /// The single gate. Voice is an unauthenticated input channel, so
+    /// nothing the policy wants confirmed runs before the user has said yes
+    /// to a prompt naming exactly what will happen.
+    async fn dispatch(
+        &self,
+        source: &str,
+        intent: &Intent,
+        signals: &Signals,
+        command: Command,
+    ) -> anyhow::Result<Handled> {
         match self.policy.decide(intent, signals) {
-            Decision::Act => Ok(()),
-            Decision::Confirm { reason } => anyhow::bail!(
-                "{source} {intent:?} needs confirmation ({reason}); \
-                 spoken-confirm flow lands in P2, not executed"
-            ),
+            Decision::Act => self.executor.execute(command).await.map(Handled::Done),
+            Decision::Confirm { reason } => self.ask(command, reason).await,
             Decision::Refuse { reason } => anyhow::bail!("{source} {intent:?} refused: {reason}"),
         }
+    }
+
+    /// Park `command` and word the question. A window target is resolved
+    /// now, so the prompt names the window rather than the query, and so a
+    /// later yes can check it still means the same window.
+    async fn ask(&self, command: Command, reason: String) -> anyhow::Result<Handled> {
+        let window = match command.window_target() {
+            Some(target) => Some(self.executor.resolve_target(target).await?),
+            None => None,
+        };
+        let describe = command.describe(window.as_ref().map(|w| w.title.as_str()));
+        tracing::info!("asking to confirm: {describe} ({reason})");
+        let replaced = self.pending.arm(Pending {
+            command,
+            window_id: window.map(|w| w.id),
+            reason,
+            describe: describe.clone(),
+            deadline: Instant::now() + self.confirm_window,
+        });
+        if let Some(p) = replaced {
+            tracing::info!("dropped unconfirmed {}: newer prompt", p.describe);
+        }
+        Ok(Handled::Confirm(format!("{}? say yes", capitalize(&describe))))
+    }
+
+    /// "yes": run the parked command if it is still in time and its window
+    /// is still the one the prompt named.
+    async fn confirm(&self) -> anyhow::Result<Handled> {
+        let pending = match self.pending.take(Instant::now()) {
+            Taken::Nothing => anyhow::bail!("nothing to confirm"),
+            Taken::Expired(p) => anyhow::bail!(
+                "too late to confirm {} (say the command again)",
+                p.describe
+            ),
+            Taken::Live(p) => p,
+        };
+        let command = match pending.command.window_target() {
+            Some(target) => {
+                // Re-resolve rather than trust the id: a query must still
+                // pick the same window, an id must still exist, and the
+                // focused window must still be the one described.
+                let current = self.executor.resolve_target(target).await.ok();
+                check_target(&pending, current.as_ref())?;
+                let id = current.map(|w| w.id).unwrap_or_default();
+                pending.command.with_window_target(WindowTarget::Id(id))
+            }
+            None => pending.command,
+        };
+        tracing::info!("confirmed: {} ({})", pending.describe, pending.reason);
+        self.executor.execute(command).await.map(Handled::Done)
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }

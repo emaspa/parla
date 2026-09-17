@@ -14,6 +14,7 @@ mod hotkeys;
 mod instance;
 mod judge;
 mod lock;
+mod policy;
 mod router;
 mod typesafe;
 mod vad;
@@ -450,51 +451,47 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
     }
     println!("fast path: no match");
 
-    let judge = judge::Judge::new(cfg.typesafe.clone())?;
-    let index = tokio::task::spawn_blocking(desktopd::DesktopIndex::from_xdg).await?;
-    // Real window/desktop state when the desktop is reachable; empty otherwise,
-    // so this stays usable over SSH.
-    let windows = desktopd::windows::WindowCtl::new()
-        .list()
-        .await
-        .unwrap_or_default();
-    let desktop_count = desktopd::kwin::list_desktops()
-        .await
-        .map(|d| d.len() as u32)
-        .unwrap_or(1);
-    let current_desktop = desktopd::kwin::current_desktop().await.unwrap_or(1);
+    // The same executor, snapshot and policy the daemon would use, so what
+    // this prints is what would have happened.
+    let judge = Arc::new(judge::Judge::new(cfg.typesafe.clone())?);
+    let executor = Arc::new(Executor::new(cfg.desktopd.clone()).await?);
+    let router = Router::new(
+        Arc::clone(&executor),
+        Arc::new(grammar),
+        Some(Arc::clone(&judge)),
+    );
+    let snapshot = router.snapshot().await?;
+    let index = executor.desktop_index();
     println!(
-        "state: {} apps indexed, {} windows open, desktop {current_desktop}/{desktop_count}",
+        "state: {} apps indexed, {} windows open, desktop {}/{}, claude {}",
         index.entries().len(),
-        windows.len()
+        snapshot.windows.len(),
+        snapshot.current_desktop,
+        snapshot.desktop_count,
+        if snapshot.claude_running {
+            "running"
+        } else {
+            "not running"
+        }
     );
 
-    let ctx = judge::Context {
-        windows: &windows,
-        index: &index,
-        current_desktop,
-        desktop_count,
-        claude_running: false,
-    };
-    match judge.judge(utterance, &ctx).await? {
-        judge::Judgment::Act {
-            intent,
-            confidence,
-            needs_confirmation,
-        } => {
-            println!("judged:    {intent:?}");
-            println!("confidence: {confidence:.2}");
-            println!(
-                "would {}",
-                if needs_confirmation {
-                    "ASK FOR CONFIRMATION before executing"
-                } else {
-                    "execute immediately"
+    match judge.judge_verdict(utterance, &snapshot.context(index)).await? {
+        judge::Verdict::Act(resolved) => {
+            println!("judged:    {:?}", resolved.intent);
+            println!("confidence: {:.2}", resolved.confidence);
+            let decision = router.policy().decide(&resolved.intent, &resolved.signals);
+            let command = command::from_resolved(resolved);
+            println!("command:   {command:?}");
+            match decision {
+                policy::Decision::Act => println!("would execute immediately"),
+                policy::Decision::Confirm { reason } => {
+                    println!("would ASK FOR CONFIRMATION before executing ({reason})")
                 }
-            );
+                policy::Decision::Refuse { reason } => println!("would refuse: {reason}"),
+            }
         }
-        judge::Judgment::Dictation => println!("judged:    dictation, not a command"),
-        judge::Judgment::Unclear(r) => println!("judged:    unclear ({r})"),
+        judge::Verdict::Dictation => println!("judged:    dictation, not a command"),
+        judge::Verdict::Unclear(r) => println!("judged:    unclear ({r})"),
     }
     Ok(())
 }

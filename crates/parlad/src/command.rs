@@ -10,6 +10,8 @@
 use desktopd::{AppTarget, Command, WindowOp, WindowTarget};
 use parla_grammar::Intent;
 
+use crate::judge::Resolved;
+
 /// The command a grammar intent asks for. Window queries keep the executor's
 /// convention that an empty query, or the bare word "window", means the
 /// focused window.
@@ -40,9 +42,78 @@ pub fn from_intent(intent: Intent) -> Command {
     }
 }
 
+/// The command a judged intent asks for. Where the judge picked a window or
+/// an application from the observed state, the command addresses it by id;
+/// the title or name in the intent was only ever a label for that choice.
+pub fn from_resolved(resolved: Resolved) -> Command {
+    let Resolved {
+        intent,
+        window_id,
+        entry_id,
+        ..
+    } = resolved;
+    let command = from_intent(intent);
+    match (command, window_id, entry_id) {
+        (Command::Window { op, .. }, Some(id), _) => Command::Window {
+            op,
+            target: WindowTarget::Id(id),
+        },
+        (Command::LaunchApp { .. }, _, Some(id)) => Command::LaunchApp {
+            app: AppTarget::Entry(id),
+        },
+        (command, _, _) => command,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::Signals;
+
+    fn resolved(intent: Intent, window_id: Option<&str>, entry_id: Option<&str>) -> Resolved {
+        Resolved {
+            intent,
+            window_id: window_id.map(String::from),
+            entry_id: entry_id.map(String::from),
+            confidence: 0.9,
+            signals: Signals::Grammar,
+        }
+    }
+
+    #[test]
+    fn judged_targets_go_by_id() {
+        let close = Intent::CloseWindow {
+            query: Some("build — Konsole".into()),
+        };
+        assert_eq!(
+            from_resolved(resolved(close.clone(), Some("{k1}"), None)),
+            Command::Window {
+                op: WindowOp::Close,
+                target: WindowTarget::Id("{k1}".into())
+            }
+        );
+        // An app chosen from the index launches by its .desktop id, and a
+        // window id that the judge did not produce leaves the query alone.
+        assert_eq!(
+            from_resolved(resolved(
+                Intent::LaunchApp {
+                    query: "Firefox".into()
+                },
+                None,
+                Some("firefox.desktop")
+            )),
+            Command::LaunchApp {
+                app: AppTarget::Entry("firefox.desktop".into())
+            }
+        );
+        assert_eq!(
+            from_resolved(resolved(close, None, None)),
+            Command::Window {
+                op: WindowOp::Close,
+                target: WindowTarget::Query("build — Konsole".into())
+            }
+        );
+    }
 
     #[test]
     fn window_queries_keep_the_executor_convention() {

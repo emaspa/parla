@@ -22,7 +22,7 @@ use parla_grammar::Intent;
 use serde_json::json;
 
 use crate::config::TypeSafeConfig;
-use crate::router::policy::{Decision, Policy, Signals};
+use crate::policy::{Policy, Signals};
 use crate::typesafe::{Client, NoulCriteria, Question, Response, MAX_CHOICE_OPTIONS};
 use desktopd::windows::Window;
 
@@ -63,8 +63,11 @@ pub struct Resolved {
     pub intent: Intent,
     /// KWin id of the window the user named, when the target was chosen from
     /// the open-window list. The `Intent` carries the title as a query for
-    /// now; an executor that takes ids should prefer this.
+    /// the policy and the logs; execution goes by this id.
     pub window_id: Option<String>,
+    /// `.desktop` id of the application the user named, when the target was
+    /// chosen from the installed-application list.
+    pub entry_id: Option<String>,
     /// Weakest link across the judgments that built the intent.
     pub confidence: f64,
     /// What the model said about risk and dictation, for [`Policy::decide`].
@@ -82,37 +85,6 @@ pub enum Verdict {
     Dictation,
     /// Not confidently anything. Carries a reason for the notification.
     Unclear(String),
-}
-
-/// Flattened view of a [`Verdict`], kept for `parlad --judge` until main.rs
-/// adopts `Verdict` (it loses the window id and the confirmation reason).
-#[derive(Debug)]
-pub enum Judgment {
-    Act {
-        intent: Intent,
-        confidence: f64,
-        needs_confirmation: bool,
-    },
-    Dictation,
-    Unclear(String),
-}
-
-impl Verdict {
-    /// Apply the policy and flatten: a refusal becomes `Unclear`.
-    pub fn flatten(self, policy: &Policy) -> Judgment {
-        match self {
-            Verdict::Act(r) => match policy.decide(&r.intent, &r.signals) {
-                Decision::Refuse { reason } => Judgment::Unclear(reason),
-                decision => Judgment::Act {
-                    intent: r.intent,
-                    confidence: r.confidence,
-                    needs_confirmation: matches!(decision, Decision::Confirm { .. }),
-                },
-            },
-            Verdict::Dictation => Judgment::Dictation,
-            Verdict::Unclear(s) => Judgment::Unclear(s),
-        }
-    }
 }
 
 pub struct Judge {
@@ -171,14 +143,6 @@ impl Judge {
 
         Ok(compose(&resp, &self.policy, &candidates))
     }
-
-    /// [`Self::judge_verdict`] with this judge's policy applied.
-    pub async fn judge(&self, utterance: &str, ctx: &Context<'_>) -> anyhow::Result<Judgment> {
-        Ok(self
-            .judge_verdict(utterance, ctx)
-            .await?
-            .flatten(&self.policy))
-    }
 }
 
 /// Turn the answers into an intent plus the signals that gate it. No
@@ -209,6 +173,7 @@ fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict,
     let mut confidence = intent_conf;
     let mut args: BTreeMap<String, String> = BTreeMap::new();
     let mut window_id = None;
+    let mut entry_id = None;
     // The intent name to build; show_app resolves to launch or focus.
     let mut build_name = name;
 
@@ -235,7 +200,8 @@ fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict,
                     build_name = "focus_window";
                 }
                 Target::App(app) => {
-                    args.insert("query".into(), app.to_string());
+                    args.insert("query".into(), app.name.clone());
+                    entry_id = Some(app.id.clone());
                     build_name = "launch_app";
                 }
                 Target::Focused => {
@@ -251,7 +217,7 @@ fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict,
                     window_id = Some(w.id.clone());
                 }
                 Target::App(app) => {
-                    args.insert("query".into(), app.to_string());
+                    args.insert("query".into(), app.name.clone());
                 }
                 // Only an explicit, confident choice of the focused window
                 // means "no query"; silence is not that choice.
@@ -312,6 +278,7 @@ fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict,
     Ok(Verdict::Act(Resolved {
         intent,
         window_id,
+        entry_id,
         confidence,
         signals: Signals::Judged {
             confidence,
@@ -330,18 +297,28 @@ enum Pick<'a> {
 
 /// What a `target` key denotes.
 enum Target<'a> {
-    App(&'a str),
+    App(&'a AppCandidate),
     Window(&'a Window),
     Focused,
     Unnamed,
+}
+
+/// One installed application offered to the model.
+#[derive(Debug, Clone)]
+struct AppCandidate {
+    /// `.desktop` id, so a chosen app launches by id rather than by a
+    /// second fuzzy match on its name.
+    id: String,
+    name: String,
+    generic_name: Option<String>,
 }
 
 /// Candidate values assembled by code, for the model to select among, and
 /// the questions built from them so answers can be checked against exactly
 /// what was sent.
 struct Candidates {
-    /// Installed application names, keyed `a:<index>`.
-    apps: Vec<String>,
+    /// Installed applications, keyed `a:<index>`.
+    apps: Vec<AppCandidate>,
     /// Open windows, keyed `w:<index>`.
     windows: Vec<Window>,
     /// Trailing spans of the utterance, keyed `p:<index>`.
@@ -361,7 +338,11 @@ impl Candidates {
         let mut apps = Vec::new();
         for e in ctx.index.shortlist(utterance, APP_CANDIDATES) {
             if seen.insert(e.name.to_lowercase()) {
-                apps.push((e.name.clone(), e.generic_name.clone()));
+                apps.push(AppCandidate {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    generic_name: e.generic_name.clone(),
+                });
             }
         }
 
@@ -391,7 +372,7 @@ impl Candidates {
     }
 
     fn assemble(
-        apps: Vec<(String, Option<String>)>,
+        apps: Vec<AppCandidate>,
         windows: Vec<Window>,
         spans: Vec<String>,
         current_desktop: u32,
@@ -399,10 +380,10 @@ impl Candidates {
         send_window_titles: bool,
     ) -> Self {
         let mut targets: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        for (i, (name, generic)) in apps.iter().enumerate() {
-            let desc = match generic {
-                Some(g) => format!("installed application {name} ({g})"),
-                None => format!("installed application {name}"),
+        for (i, app) in apps.iter().enumerate() {
+            let desc = match &app.generic_name {
+                Some(g) => format!("installed application {} ({g})", app.name),
+                None => format!("installed application {}", app.name),
             };
             targets.insert(format!("{APP_KEY}{i}"), json!(desc));
         }
@@ -537,7 +518,7 @@ impl Candidates {
             .all(|o| o.len() <= MAX_CHOICE_OPTIONS));
 
         Self {
-            apps: apps.into_iter().map(|(name, _)| name).collect(),
+            apps,
             windows,
             spans,
             desktop_count,
@@ -714,6 +695,7 @@ fn intent_criteria() -> BTreeMap<String, serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::Decision;
 
     /// Recorded answers, exactly as the API returns them.
     fn resp(json: serde_json::Value) -> Response {
@@ -760,7 +742,13 @@ mod tests {
     fn cand_with(apps: &[&str], windows: &[(&str, &str, &str)], desktops: u32, utterance: &str) -> Candidates {
         let words: Vec<&str> = utterance.split_whitespace().collect();
         Candidates::assemble(
-            apps.iter().map(|a| ((*a).to_string(), None)).collect(),
+            apps.iter()
+                .map(|a| AppCandidate {
+                    id: format!("{}.desktop", a.to_lowercase()),
+                    name: (*a).to_string(),
+                    generic_name: None,
+                })
+                .collect(),
             windows.iter().map(|(i, t, c)| window(i, t, c)).collect(),
             (0..words.len()).map(|i| words[i..].join(" ")).collect(),
             1,
@@ -819,6 +807,7 @@ mod tests {
         );
         assert_eq!(decision, Decision::Act);
         assert_eq!(got.window_id, None);
+        assert_eq!(got.entry_id.as_deref(), Some("firefox.desktop"));
     }
 
     #[test]
@@ -973,7 +962,7 @@ mod tests {
         unclear(compose(&none, &policy(), &cand()));
 
         // Low confidence with an otherwise complete answer is the policy's
-        // refusal, and the flattened view turns that into Unclear.
+        // refusal.
         let shaky = resp(serde_json::json!({
             "intent": choice("close_window", 0.20),
             "target": choice(FOCUSED, 0.9),
@@ -981,10 +970,6 @@ mod tests {
             "is_destructive": noul(0.1),
         }));
         refused(compose(&shaky, &policy(), &cand()));
-        assert!(matches!(
-            compose(&shaky, &policy(), &cand()).flatten(&policy()),
-            Judgment::Unclear(_)
-        ));
     }
 
     #[test]
@@ -1182,6 +1167,7 @@ mod tests {
             }
         );
         assert_eq!(got.window_id.as_deref(), Some("{k1}"));
+        assert_eq!(got.entry_id, None);
     }
 
     #[test]

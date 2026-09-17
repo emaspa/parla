@@ -2,19 +2,15 @@
 //! through the fast-path grammar first and fall through to the judged path.
 //! Both paths end in the same [`Policy`] decision.
 
-// Declared here rather than in main.rs so the module list there stays the
-// daemon's; `mod policy;` in main.rs can replace this line later.
-#[path = "policy.rs"]
-pub mod policy;
-
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use desktopd::{DesktopIndex, Executor, Window};
 use parla_grammar::{Grammar, Intent};
 
+use crate::command::{from_intent, from_resolved};
 use crate::judge::{Context, Judge, Verdict};
-use policy::{Decision, Policy, Signals};
+use crate::policy::{Decision, Policy, Signals};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -70,6 +66,11 @@ impl Router {
         }
     }
 
+    /// The thresholds both paths are gated by.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
     /// Handle a finished transcript. Returns a short human-readable result
     /// (used for notification/TTS); Err for failures.
     pub async fn handle(&self, mode: Mode, transcript: &str) -> anyhow::Result<String> {
@@ -110,7 +111,7 @@ impl Router {
             tracing::info!("fast path: {intent:?}");
             return self
                 .executor
-                .execute(crate::command::from_intent(intent))
+                .execute(from_intent(intent))
                 .await;
         }
 
@@ -143,7 +144,7 @@ impl Router {
                     resolved.window_id
                 );
                 self.executor
-                    .execute(crate::command::from_intent(resolved.intent))
+                    .execute(from_resolved(resolved))
                     .await
             }
             Verdict::Dictation => {

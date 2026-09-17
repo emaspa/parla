@@ -6,7 +6,7 @@ members = ["crates/parlad", "crates/desktopd", "crates/grammar"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/sparvoli/parla"
+repository = "https://github.com/emaspa/parla"
 
 [workspace.dependencies]
 anyhow = "1"

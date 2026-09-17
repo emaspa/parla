@@ -43,10 +43,7 @@ impl CompiledRule {
         let mut prefix = Vec::new();
         let mut slot = None;
         for token in pattern.split_whitespace() {
-            if let Some(inner) = token
-                .strip_prefix('{')
-                .and_then(|t| t.strip_suffix('}'))
-            {
+            if let Some(inner) = token.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
                 // captures only allowed as the final token
                 slot = Some(inner.to_string());
             } else if slot.is_some() {
@@ -89,10 +86,8 @@ impl CompiledRule {
                 }
             }
             Some(_) => {
-                if rest.is_empty() {
-                    None // capture slot must actually capture something
-                } else if self.max_capture_words.is_some_and(|max| rest.len() > max) {
-                    None // prose, not a command — let it fall through to the agent
+                if rest.is_empty() || self.max_capture_words.is_some_and(|max| rest.len() > max) {
+                    None // empty capture or prose: let it fall through to the agent
                 } else {
                     Some(Some(rest))
                 }
@@ -102,9 +97,26 @@ impl CompiledRule {
 
     /// Build the intent, merging the captured slot into args under its name.
     pub fn build_intent(&self, capture: Option<&[&str]>) -> Option<Intent> {
+        let capture = capture.map(capture_string);
+        self.build_intent_from_raw(capture.as_deref())
+    }
+
+    /// Build from an untouched utterance span. Numeric slots, model names and
+    /// key chords are normalized; text and query slots preserve the user's input.
+    pub fn build_intent_from_raw(&self, capture: Option<&str>) -> Option<Intent> {
         let mut args = self.args.clone();
         if let (Some(slot), Some(cap)) = (&self.slot, capture) {
-            args.insert(slot.clone(), capture_string(cap));
+            let value = if slot == "n" {
+                crate::normalize::numbers_to_digits(&crate::normalize::normalize(cap))
+            } else if (self.intent == "key" && slot == "chord")
+                || (matches!(self.intent.as_str(), "start_claude" | "claude_model")
+                    && slot == "model")
+            {
+                crate::normalize::normalize(cap)
+            } else {
+                cap.to_string()
+            };
+            args.insert(slot.clone(), value);
         }
         Intent::from_args(&self.intent, &args)
     }

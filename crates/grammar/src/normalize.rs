@@ -1,41 +1,89 @@
-/// Utterance normalization: whisper output is free-form text with punctuation
-/// and capitalization we don't want the grammar to care about.
+//! Normalize words for matching while retaining their original UTF-8 spans.
 
-/// Lowercase, strip punctuation (keep inner apostrophes), collapse whitespace,
-/// and convert spelled-out small numbers to digits ("desktop two" -> "desktop 2").
+use std::ops::Range;
+
+/// Lowercase, strip punctuation (keep inner apostrophes), and collapse
+/// whitespace. Number words stay intact; only numeric grammar slots convert them.
 pub fn normalize(text: &str) -> String {
-    let lowered = text.to_lowercase();
-    let mut out = String::with_capacity(lowered.len());
-    let chars: Vec<char> = lowered.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        if c.is_alphanumeric() || c == ' ' {
-            out.push(c);
-        } else if c == '\'' {
-            // keep apostrophes only between letters ("don't", "kate's")
-            let prev_alpha = i > 0 && chars[i - 1].is_alphabetic();
-            let next_alpha = i + 1 < chars.len() && chars[i + 1].is_alphabetic();
-            if prev_alpha && next_alpha {
-                out.push(c);
-            } else {
-                out.push(' ');
+    words_with_spans(text)
+        .into_iter()
+        .map(|word| word.normalized)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A matching word and its byte range in the original utterance. The first
+/// and last words of each whitespace-delimited fragment include its surrounding
+/// punctuation so captures retain quotes, flags and path prefixes.
+pub(crate) struct MappedWord {
+    pub normalized: String,
+    pub raw: Range<usize>,
+}
+
+pub(crate) fn words_with_spans(text: &str) -> Vec<MappedWord> {
+    let mut words = Vec::new();
+    let mut cursor = 0;
+    for fragment in text.split_whitespace() {
+        let base = cursor + text[cursor..].find(fragment).unwrap();
+        cursor = base + fragment.len();
+        let first = words.len();
+        let mut start = None;
+        let mut normalized = String::new();
+        let mut chars = fragment.char_indices().peekable();
+        let mut prev_alpha = false;
+        while let Some((offset, c)) = chars.next() {
+            let inner_apostrophe = c == '\''
+                && prev_alpha
+                && chars.peek().is_some_and(|(_, next)| next.is_alphabetic());
+            if c.is_alphanumeric() || inner_apostrophe {
+                start.get_or_insert(base + offset);
+                normalized.extend(c.to_lowercase());
+            } else if let Some(start) = start.take() {
+                words.push(MappedWord {
+                    normalized: std::mem::take(&mut normalized),
+                    raw: start..base + offset,
+                });
             }
-        } else {
-            out.push(' ');
+            prev_alpha = c.is_alphabetic();
+        }
+        if let Some(start) = start {
+            words.push(MappedWord {
+                normalized,
+                raw: start..cursor,
+            });
+        }
+        if words.len() > first {
+            words[first].raw.start = base;
+            words.last_mut().unwrap().raw.end = cursor;
         }
     }
-    let collapsed = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    numbers_to_digits(&collapsed)
+    words
 }
 
 const NUMBER_WORDS: [(&str, u32); 20] = [
-    ("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5),
-    ("six", 6), ("seven", 7), ("eight", 8), ("nine", 9), ("ten", 10),
-    ("eleven", 11), ("twelve", 12), ("thirteen", 13), ("fourteen", 14),
-    ("fifteen", 15), ("sixteen", 16), ("seventeen", 17), ("eighteen", 18),
-    ("nineteen", 19), ("twenty", 20),
+    ("one", 1),
+    ("two", 2),
+    ("three", 3),
+    ("four", 4),
+    ("five", 5),
+    ("six", 6),
+    ("seven", 7),
+    ("eight", 8),
+    ("nine", 9),
+    ("ten", 10),
+    ("eleven", 11),
+    ("twelve", 12),
+    ("thirteen", 13),
+    ("fourteen", 14),
+    ("fifteen", 15),
+    ("sixteen", 16),
+    ("seventeen", 17),
+    ("eighteen", 18),
+    ("nineteen", 19),
+    ("twenty", 20),
 ];
 
-fn numbers_to_digits(text: &str) -> String {
+pub(crate) fn numbers_to_digits(text: &str) -> String {
     text.split(' ')
         .map(|w| {
             NUMBER_WORDS
@@ -75,9 +123,9 @@ mod tests {
     }
 
     #[test]
-    fn converts_number_words() {
-        assert_eq!(normalize("go to desktop two"), "go to desktop 2");
-        assert_eq!(normalize("desktop twelve"), "desktop 12");
+    fn preserves_number_words() {
+        assert_eq!(normalize("go to desktop two"), "go to desktop two");
+        assert_eq!(normalize("desktop twelve"), "desktop twelve");
     }
 
     #[test]

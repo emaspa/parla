@@ -2,13 +2,92 @@ use std::path::{Path, PathBuf};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use unicase::UniCase;
+
+fn xdg_data_dirs(
+    home: Option<&Path>,
+    data_home: Option<PathBuf>,
+    data_dirs: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(user) = data_home
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(".local/share")))
+    {
+        dirs.push(user);
+    }
+    let system: Vec<_> = data_dirs
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|p| p.is_absolute())
+        .collect();
+    if system.is_empty() {
+        dirs.extend([
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ]);
+    } else {
+        dirs.extend(system);
+    }
+    if let Some(home) = home {
+        dirs.push(home.join(".local/share/flatpak/exports/share"));
+    }
+    dirs.push(PathBuf::from("/var/lib/flatpak/exports/share"));
+    dirs
+}
+
+fn can_execute(binary: &str) -> bool {
+    fn executable(path: &Path) -> bool {
+        let Ok(metadata) = path.metadata() else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+    let path = Path::new(binary);
+    if path.is_absolute() {
+        return executable(path);
+    }
+    if binary.is_empty() || path.components().count() != 1 {
+        return false;
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| executable(&dir.join(binary))))
+}
+
+fn content_words(text: &str) -> Vec<String> {
+    let normalized = crate::normalize::normalize(text);
+    let mut words = normalized.split_whitespace().peekable();
+    let mut content = Vec::new();
+    while let Some(word) = words.next() {
+        if matches!(word, "please" | "the" | "a" | "an" | "up") {
+            continue;
+        }
+        if word == "for" && words.peek() == Some(&"me") {
+            words.next();
+            continue;
+        }
+        content.push(word.to_string());
+    }
+    content
+}
 
 /// A parsed .desktop application entry.
 #[derive(Debug, Clone)]
 pub struct DesktopEntry {
     /// Desktop id, e.g. `org.kde.dolphin.desktop` (path relative to the
-    /// applications dir, as understood by kioclient/gtk-launch).
+    /// applications dir with separators replaced by hyphens).
     pub id: String,
     pub name: String,
     pub generic_name: Option<String>,
@@ -43,30 +122,20 @@ pub struct DesktopIndex {
 impl DesktopIndex {
     /// Load from the standard XDG application directories.
     pub fn from_xdg() -> Self {
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        let home = std::env::var("HOME").map(PathBuf::from).ok();
-        if let Some(h) = &home {
-            dirs.push(h.join(".local/share/applications"));
-        }
-        if let Ok(xdg) = std::env::var("XDG_DATA_DIRS") {
-            dirs.extend(xdg.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
-        } else {
-            dirs.push(PathBuf::from("/usr/local/share"));
-            dirs.push(PathBuf::from("/usr/share"));
-        }
-        if let Some(h) = &home {
-            // flatpak exports
-            dirs.push(h.join(".local/share/flatpak/exports/share/applications"));
-        }
-        dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
-        Self::from_dirs(&dirs)
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+        let data_dirs = std::env::var_os("XDG_DATA_DIRS");
+        Self::from_dirs(&xdg_data_dirs(home.as_deref(), data_home, data_dirs))
     }
 
+    /// Load data directories in precedence order, appending `applications`
+    /// exactly once to each directory. The first occurrence of each id wins.
     pub fn from_dirs(data_dirs: &[PathBuf]) -> Self {
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for dir in data_dirs {
-            Self::load_dir(&dir.join("applications"), &mut entries, &mut seen);
+            let applications = dir.join("applications");
+            Self::load_dir(&applications, &applications, &mut entries, &mut seen);
         }
         tracing::info!("desktop index: {} entries", entries.len());
         Self {
@@ -78,6 +147,7 @@ impl DesktopIndex {
 
     fn load_dir(
         dir: &Path,
+        applications: &Path,
         out: &mut Vec<DesktopEntry>,
         seen: &mut std::collections::HashSet<String>,
     ) {
@@ -86,21 +156,29 @@ impl DesktopIndex {
         };
         for entry in read.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                Self::load_dir(&path, out, seen);
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                Self::load_dir(&path, applications, out, seen);
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            let Ok(relative) = path.strip_prefix(applications) else {
                 continue;
             };
+            let Some(parts) = relative
+                .iter()
+                .map(|part| part.to_str())
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let id = parts.join("-");
             // first dir in XDG order wins for duplicate ids
-            if !seen.insert(name.to_string()) {
+            if !seen.insert(id.clone()) {
                 continue;
             }
-            if let Some(entry) = Self::parse(&path, name) {
+            if let Some(entry) = Self::parse(&path, &id) {
                 out.push(entry);
             }
         }
@@ -115,6 +193,8 @@ impl DesktopIndex {
         let mut exec = None;
         let mut terminal = false;
         let mut hidden = false;
+        let mut entry_type = None;
+        let mut try_exec = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -133,6 +213,8 @@ impl DesktopIndex {
                 continue;
             }
             match key.trim() {
+                "Type" => entry_type = Some(value.trim()),
+                "TryExec" => try_exec = Some(value.trim()),
                 "Name" => name = Some(value.trim().to_string()),
                 "GenericName" => generic_name = Some(value.trim().to_string()),
                 "Keywords" => keywords.extend(
@@ -147,7 +229,10 @@ impl DesktopIndex {
                 _ => {}
             }
         }
-        if hidden {
+        if hidden
+            || entry_type != Some("Application")
+            || try_exec.is_some_and(|binary| !can_execute(binary))
+        {
             return None;
         }
         Some(DesktopEntry {
@@ -171,12 +256,8 @@ impl DesktopIndex {
     /// fox for me" still surfaces Firefox. Callers that cannot isolate the
     /// name themselves use this to narrow the field before choosing.
     pub fn shortlist(&self, text: &str, limit: usize) -> Vec<&DesktopEntry> {
-        let words: Vec<String> = text
-            .split_whitespace()
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_lowercase()
-            })
+        let words: Vec<String> = content_words(text)
+            .into_iter()
             .filter(|w| w.len() >= 3)
             .collect();
         if words.is_empty() {
@@ -185,15 +266,15 @@ impl DesktopIndex {
 
         // Probe with each content word, plus the whole utterance so multi-word
         // names ("visual studio code") can still win.
-        let mut probes = words;
-        probes.push(text.to_lowercase());
+        let mut probes: Vec<Vec<String>> = words.iter().map(|w| vec![w.clone()]).collect();
+        probes.push(words);
 
         let mut scored: Vec<(i64, &DesktopEntry)> = Vec::new();
         for e in &self.entries {
             let targets: Vec<String> = e.match_targets().iter().map(|t| t.to_lowercase()).collect();
-            let best = targets
+            let best = probes
                 .iter()
-                .flat_map(|t| probes.iter().filter_map(|p| self.matcher.fuzzy_match(t, p)))
+                .filter_map(|probe| self.score(&targets, probe))
                 .max();
             if let Some(score) = best {
                 if score >= self.min_score {
@@ -209,44 +290,58 @@ impl DesktopIndex {
     /// Resolve a spoken query ("fire fox", "dolphin", "kate") to the best
     /// matching entry. Exact and prefix matches beat fuzzy matches.
     pub fn lookup(&self, query: &str) -> Option<&DesktopEntry> {
-        let q = UniCase::new(query.trim().to_lowercase());
-        let qs = q.as_ref();
-
-        // 1. exact name / generic name / id stem
-        if let Some(e) = self.entries.iter().find(|e| {
-            UniCase::new(e.name.to_lowercase()) == q
-                || e.generic_name
-                    .as_ref()
-                    .is_some_and(|g| UniCase::new(g.to_lowercase()) == q)
-        }) {
-            return Some(e);
+        let words = content_words(query);
+        if words.is_empty() {
+            return None;
         }
-
-        // 2. prefix match on name
-        if let Some(e) = self
-            .entries
-            .iter()
-            .find(|e| e.name.to_lowercase().starts_with(qs))
-        {
-            return Some(e);
-        }
-
-        // 3. fuzzy over all match targets, best score above threshold wins
         let mut best: Option<(i64, &DesktopEntry)> = None;
-        for e in &self.entries {
-            for target in e.match_targets() {
-                if let Some(score) = self.matcher.fuzzy_match(&target.to_lowercase(), qs) {
-                    if score >= self.min_score && best.is_none_or(|(bs, _)| score > bs) {
-                        best = Some((score, e));
-                    }
-                    break; // first matching target per entry is enough
+        for entry in &self.entries {
+            let targets: Vec<String> = entry
+                .match_targets()
+                .iter()
+                .map(|t| t.to_lowercase())
+                .collect();
+            if let Some(score) = self.score(&targets, &words) {
+                if best.is_none_or(|(previous, _)| score > previous) {
+                    best = Some((score, entry));
                 }
             }
         }
-        best.map(|(_, e)| {
-            tracing::debug!("fuzzy matched {:?} -> {}", query, e.id);
-            e
-        })
+        best.map(|(_, entry)| entry)
+    }
+
+    fn score(&self, targets: &[String], words: &[String]) -> Option<i64> {
+        // Subsequence scores alone let "kate" match "KDE Partition Manager".
+        // Every content token must occur contiguously in at least one target.
+        if words.is_empty()
+            || !words
+                .iter()
+                .all(|word| targets.iter().any(|target| target.contains(word)))
+        {
+            return None;
+        }
+        let query = words.join(" ");
+        let compact = words.concat();
+        targets
+            .iter()
+            .map(|target| {
+                if target == &query || target == &compact {
+                    10_000
+                } else if target.starts_with(&query) || target.starts_with(&compact) {
+                    5_000
+                } else {
+                    // Consider every target, including keywords after a weak name
+                    // hit. Token coverage also permits tokens split across targets.
+                    self.matcher
+                        .fuzzy_match(target, &query)
+                        .into_iter()
+                        .chain(self.matcher.fuzzy_match(target, &compact))
+                        .max()
+                        .unwrap_or(0)
+                        .clamp(self.min_score, 4_999)
+                }
+            })
+            .max()
     }
 }
 
@@ -256,7 +351,12 @@ mod tests {
 
     /// Build an index over a throwaway applications dir.
     fn index_of(entries: &[(&str, &str)]) -> (PathBuf, DesktopIndex) {
-        let root = std::env::temp_dir().join(format!("parla-desktop-test-{}", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "parla-desktop-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let apps = root.join("applications");
         std::fs::create_dir_all(&apps).unwrap();
         for (id, name) in entries {
@@ -266,8 +366,77 @@ mod tests {
             )
             .unwrap();
         }
-        let idx = DesktopIndex::from_dirs(&[root.clone()]);
+        let idx = DesktopIndex::from_dirs(std::slice::from_ref(&root));
         (root, idx)
+    }
+
+    #[test]
+    fn xdg_inputs_are_data_directories() {
+        let (root, _) = index_of(&[]);
+        let home = root.join("home");
+        let system = root.join("system");
+        let custom = root.join("custom");
+        for (data_dir, id, name) in [
+            (home.join(".local/share"), "app.desktop", "User App"),
+            (system.clone(), "app.desktop", "System App"),
+            (
+                home.join(".local/share/flatpak/exports/share"),
+                "flatpak.desktop",
+                "Flatpak App",
+            ),
+            (custom.clone(), "app.desktop", "Custom App"),
+        ] {
+            std::fs::create_dir_all(data_dir.join("applications")).unwrap();
+            std::fs::write(
+                data_dir.join("applications").join(id),
+                format!("[Desktop Entry]\nType=Application\nName={name}\n"),
+            )
+            .unwrap();
+        }
+        let dirs = xdg_data_dirs(Some(&home), None, Some(system.clone().into_os_string()));
+        assert_eq!(dirs[0], home.join(".local/share"));
+        assert_eq!(
+            dirs.last().unwrap(),
+            &PathBuf::from("/var/lib/flatpak/exports/share")
+        );
+        let index = DesktopIndex::from_dirs(&dirs);
+        assert_eq!(
+            index
+                .entries()
+                .iter()
+                .find(|entry| entry.id == "app.desktop")
+                .unwrap()
+                .name,
+            "User App"
+        );
+        assert!(index
+            .entries()
+            .iter()
+            .any(|entry| entry.id == "flatpak.desktop"));
+        let dirs = xdg_data_dirs(
+            Some(&home),
+            Some(custom.clone()),
+            Some(system.into_os_string()),
+        );
+        assert_eq!(dirs[0], custom);
+        let index = DesktopIndex::from_dirs(&dirs);
+        assert_eq!(
+            index
+                .entries()
+                .iter()
+                .find(|entry| entry.id == "app.desktop")
+                .unwrap()
+                .name,
+            "Custom App"
+        );
+        assert_eq!(
+            xdg_data_dirs(None, None, Some("".into()))[..2],
+            [
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share")
+            ]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

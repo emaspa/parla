@@ -102,6 +102,12 @@ impl Executor {
         crate::launcher::launch_app(&entry, &self.cfg).await
     }
 
+    /// The .desktop index, for callers that need to offer candidates rather
+    /// than resolve a single query.
+    pub fn desktop_index(&self) -> &DesktopIndex {
+        &self.index
+    }
+
     pub fn resolve_app(&self, query: &str) -> anyhow::Result<parla_grammar::DesktopEntry> {
         self.index
             .lookup(query)

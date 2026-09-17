@@ -164,6 +164,48 @@ impl DesktopIndex {
         &self.entries
     }
 
+    /// Plausible entries for a whole utterance, best first.
+    ///
+    /// [`Self::lookup`] needs an already-isolated app name; this takes the raw
+    /// words and scores every entry against each of them, so "bring up fire
+    /// fox for me" still surfaces Firefox. Callers that cannot isolate the
+    /// name themselves use this to narrow the field before choosing.
+    pub fn shortlist(&self, text: &str, limit: usize) -> Vec<&DesktopEntry> {
+        let words: Vec<String> = text
+            .split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .filter(|w| w.len() >= 3)
+            .collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+
+        // Probe with each content word, plus the whole utterance so multi-word
+        // names ("visual studio code") can still win.
+        let mut probes = words;
+        probes.push(text.to_lowercase());
+
+        let mut scored: Vec<(i64, &DesktopEntry)> = Vec::new();
+        for e in &self.entries {
+            let targets: Vec<String> = e.match_targets().iter().map(|t| t.to_lowercase()).collect();
+            let best = targets
+                .iter()
+                .flat_map(|t| probes.iter().filter_map(|p| self.matcher.fuzzy_match(t, p)))
+                .max();
+            if let Some(score) = best {
+                if score >= self.min_score {
+                    scored.push((score, e));
+                }
+            }
+        }
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.truncate(limit);
+        scored.into_iter().map(|(_, e)| e).collect()
+    }
+
     /// Resolve a spoken query ("fire fox", "dolphin", "kate") to the best
     /// matching entry. Exact and prefix matches beat fuzzy matches.
     pub fn lookup(&self, query: &str) -> Option<&DesktopEntry> {
@@ -205,5 +247,51 @@ impl DesktopIndex {
             tracing::debug!("fuzzy matched {:?} -> {}", query, e.id);
             e
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an index over a throwaway applications dir.
+    fn index_of(entries: &[(&str, &str)]) -> (PathBuf, DesktopIndex) {
+        let root = std::env::temp_dir().join(format!("parla-desktop-test-{}", std::process::id()));
+        let apps = root.join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        for (id, name) in entries {
+            std::fs::write(
+                apps.join(id),
+                format!("[Desktop Entry]\nType=Application\nName={name}\nExec=/bin/true\n"),
+            )
+            .unwrap();
+        }
+        let idx = DesktopIndex::from_dirs(&[root.clone()]);
+        (root, idx)
+    }
+
+    #[test]
+    fn shortlist_finds_the_app_inside_a_sentence() {
+        let (root, idx) = index_of(&[
+            ("firefox.desktop", "Firefox"),
+            ("org.kde.kate.desktop", "Kate"),
+            ("org.kde.dolphin.desktop", "Dolphin"),
+        ]);
+
+        // lookup() needs the name already isolated and fails on a sentence;
+        // shortlist() is what lets a caller narrow before choosing.
+        let names = |text: &str| -> Vec<String> {
+            idx.shortlist(text, 8)
+                .iter()
+                .map(|e| e.name.clone())
+                .collect()
+        };
+        assert!(names("could you bring up firefox for me").contains(&"Firefox".to_string()));
+        assert!(names("shut down kate please").contains(&"Kate".to_string()));
+        // Nothing app-like in the utterance: no candidates rather than a
+        // bogus low-score hit.
+        assert!(names("what is the weather tomorrow").is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

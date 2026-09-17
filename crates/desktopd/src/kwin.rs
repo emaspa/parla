@@ -29,6 +29,19 @@ pub async fn list_desktops() -> anyhow::Result<Vec<(u32, String, String)>> {
     Ok(desktops)
 }
 
+/// 1-based number of the current desktop.
+pub async fn current_desktop() -> anyhow::Result<u32> {
+    let conn = Connection::session().await?;
+    let vdm = VirtualDesktopManagerProxy::new(&conn).await?;
+    let current = vdm.current().await?;
+    let desktops = list_desktops().await?;
+    let idx = desktops
+        .iter()
+        .position(|(_, id, _)| *id == current)
+        .ok_or_else(|| anyhow::anyhow!("current desktop {current} not in the desktop list"))?;
+    Ok(idx as u32 + 1)
+}
+
 /// Switch to the 1-based desktop number n.
 pub async fn switch_to(n: u32) -> anyhow::Result<()> {
     let conn = Connection::session().await?;

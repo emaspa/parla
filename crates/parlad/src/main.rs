@@ -167,6 +167,11 @@ async fn run() -> anyhow::Result<()> {
                     Ok(name) => {
                         let mode = capture.as_ref().map(|c| c.mode);
                         tracing::info!("{mode:?} capture started on {name}");
+                        // The cue is the "speak now" signal, so it waits
+                        // for the device to be open and recording.
+                        if cfg.router.cues {
+                            cues::play(cues::Cue::Start);
+                        }
                     }
                     Err(e) => {
                         tracing::error!("capture start failed: {e:#}");
@@ -274,9 +279,6 @@ fn start_capture(
     match CaptureSession::start(cfg.audio.device.clone(), max_samples) {
         Ok(session) => {
             tracing::debug!("{mode:?} capture starting");
-            if cfg.router.cues {
-                cues::play(cues::Cue::Start);
-            }
             *capture = Some(Capture {
                 mode,
                 session,

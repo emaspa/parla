@@ -357,9 +357,12 @@ impl Candidates {
 
         // Every trailing span, so a payload can be selected verbatim instead
         // of regenerated. "tell claude to fix the test" -> "to fix the test".
+        // The payload starts a few words in ("tell claude to ..."), so when
+        // the utterance is long the start positions offered are the first
+        // PAYLOAD_SPANS, each span running to the end of the utterance.
         let words: Vec<&str> = utterance.split_whitespace().collect();
-        let tail = &words[words.len().saturating_sub(PAYLOAD_SPANS)..];
-        let spans: Vec<String> = (0..tail.len()).map(|i| tail[i..].join(" ")).collect();
+        let starts = words.len().min(PAYLOAD_SPANS);
+        let spans: Vec<String> = (0..starts).map(|i| words[i..].join(" ")).collect();
 
         Self::assemble(
             apps,
@@ -1215,6 +1218,7 @@ mod tests {
         let c = Candidates::build(&utterance, &ctx, &TypeSafeConfig::default());
         assert_eq!(c.windows.len(), WINDOW_CANDIDATES);
         assert_eq!(c.spans.len(), PAYLOAD_SPANS);
+        assert!(c.spans[0].split_whitespace().count() > PAYLOAD_SPANS, "the first span runs to the end of the utterance");
         for (id, q) in &c.questions {
             if let Some(o) = q.options() {
                 assert!(o.len() <= MAX_CHOICE_OPTIONS, "{id} offers {}", o.len());

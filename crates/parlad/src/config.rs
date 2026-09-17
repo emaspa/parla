@@ -130,6 +130,14 @@ pub struct AudioConfig {
     /// Holding the hotkey longer than this finishes the capture as if the
     /// key had been released, so a lost release event cannot record forever.
     pub max_hold_ms: u64,
+    /// Removed: capture always resamples to 16 kHz. Accepted so an older
+    /// config still loads; `validate` warns when it is set.
+    #[serde(skip_serializing)]
+    pub sample_rate: Option<u32>,
+    /// Removed: the energy gate has no end-of-speech timeout. Accepted so an
+    /// older config still loads; `validate` warns when it is set.
+    #[serde(skip_serializing)]
+    pub end_silence_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +186,8 @@ impl Default for AudioConfig {
             max_utterance_ms: 30_000,
             min_utterance_ms: 250,
             max_hold_ms: 30_000,
+            sample_rate: None,
+            end_silence_ms: None,
         }
     }
 }
@@ -243,6 +253,12 @@ impl DaemonConfig {
     /// Reject values that would only fail later, at capture or judge time.
     pub fn validate(&self) -> anyhow::Result<()> {
         let a = &self.audio;
+        if a.sample_rate.is_some() {
+            tracing::warn!("audio.sample_rate is ignored: capture is always resampled to 16 kHz");
+        }
+        if a.end_silence_ms.is_some() {
+            tracing::warn!("audio.end_silence_ms is ignored: the energy gate has no end-of-speech timeout");
+        }
         check_unit("audio.speech_threshold", f64::from(a.speech_threshold))?;
         anyhow::ensure!(a.max_utterance_ms > 0, "audio.max_utterance_ms must be > 0");
         anyhow::ensure!(a.max_hold_ms > 0, "audio.max_hold_ms must be > 0");
@@ -314,6 +330,14 @@ fn check_unit(name: &str, v: f64) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn older_audio_fields_still_load() {
+        let cfg: DaemonConfig =
+            toml::from_str("[audio]\nsample_rate = 48000\nend_silence_ms = 700\n").unwrap();
+        assert_eq!(cfg.audio.sample_rate, Some(48000));
+        cfg.validate().unwrap();
+    }
     use super::*;
 
     #[test]

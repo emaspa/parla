@@ -90,8 +90,15 @@ impl CaptureSession {
     /// Resolves once, to the device name or the open error. Later calls
     /// pend forever, so it is safe to poll in a `select!` loop.
     pub async fn ready(&mut self) -> anyhow::Result<String> {
-        match self.ready_rx.take() {
-            Some(rx) => rx.await.context("capture thread died while opening")?,
+        // Poll the receiver in place: if this future is dropped by a
+        // `select!` before it resolves, the next call resumes waiting
+        // instead of pending forever on a receiver that was taken.
+        match self.ready_rx.as_mut() {
+            Some(rx) => {
+                let r = rx.await;
+                self.ready_rx = None;
+                r.context("capture thread died while opening")?
+            }
             None => std::future::pending().await,
         }
     }

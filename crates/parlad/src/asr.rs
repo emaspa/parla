@@ -148,7 +148,9 @@ fn filter(blocklist: &[String], text: &str) -> String {
             return head.to_string();
         }
     }
-    core.to_string()
+    // Nothing matched: hand back the transcript as whisper wrote it, with its
+    // punctuation and quotes; `core` was only for the comparison.
+    cleaned
 }
 
 /// `text` minus a trailing `suffix` (already lowercase) when it is its own
@@ -175,6 +177,12 @@ mod tests {
 
     fn blocklist() -> Vec<String> {
         crate::config::AsrConfig::default().hallucination_blocklist
+    }
+
+    #[test]
+    fn punctuation_and_quotes_survive_when_nothing_is_stripped() {
+        assert_eq!(filter(&blocklist(), "Hello, \"world\"!"), "Hello, \"world\"!");
+        assert_eq!(filter(&blocklist(), "  Is it done?  "), "Is it done?");
     }
 
     #[test]

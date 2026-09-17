@@ -2,7 +2,7 @@
 //! Konsole window to drive Claude Code — drive the tmux session directly and
 //! attach a terminal only for viewing.
 
-use crate::proc::Cmd;
+use crate::proc::{Cmd, ProcError};
 
 pub struct TmuxCtl {
     pub session: String,
@@ -32,13 +32,16 @@ impl TmuxCtl {
     /// Does the session exist? `Ok(false)` means tmux answered "no";
     /// `Err` means tmux itself could not answer (not installed, timed out).
     pub async fn session_state(&self) -> anyhow::Result<bool> {
+        // tmux answers "no" with exit 1, which the helper reports as a
+        // failure; only spawn errors and timeouts are real failures here.
         match self
             .tmux()
             .args(["has-session", "-t", &self.session])
             .output()
             .await
         {
-            Ok(o) => Ok(o.success()),
+            Ok(_) => Ok(true),
+            Err(ProcError::Failed { .. }) => Ok(false),
             Err(e) => Err(e.into()),
         }
     }

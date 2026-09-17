@@ -256,7 +256,18 @@ impl Cmd {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| self.spawn_error(e))?;
-        Ok(child.id())
+        let pid = child.id();
+        // Nobody waits on a detached child, so reap it from a thread rather
+        // than leave a zombie for the daemon's lifetime.
+        let name = self.program.clone();
+        std::thread::Builder::new()
+            .name(format!("reap-{name}"))
+            .spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            })
+            .map_err(|e| self.spawn_error(e))?;
+        Ok(pid)
     }
 }
 

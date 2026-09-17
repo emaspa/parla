@@ -17,7 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use parla_grammar::{DesktopIndex, Intent};
+use desktopd::DesktopIndex;
+use parla_grammar::Intent;
 use serde_json::json;
 
 use crate::config::TypeSafeConfig;

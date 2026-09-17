@@ -3,7 +3,9 @@
 //! and — in P3 — as an MCP server for the agent path.
 
 pub mod bus;
+pub mod command;
 pub mod config;
+pub mod desktop;
 pub mod executor;
 pub mod injector;
 pub mod kwin;
@@ -15,6 +17,8 @@ pub mod shortcuts;
 pub mod tmuxctl;
 pub mod windows;
 
+pub use command::{AppTarget, Command, WindowTarget};
 pub use config::DesktopdConfig;
+pub use desktop::{DesktopEntry, DesktopIndex};
 pub use executor::{DesktopState, Executor, Outcome, WindowOp};
 pub use windows::{Window, WindowError};

@@ -7,6 +7,7 @@
 
 mod asr;
 mod audio;
+mod command;
 mod config;
 mod cues;
 mod hotkeys;
@@ -450,7 +451,7 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
     println!("fast path: no match");
 
     let judge = judge::Judge::new(cfg.typesafe.clone())?;
-    let index = tokio::task::spawn_blocking(parla_grammar::DesktopIndex::from_xdg).await?;
+    let index = tokio::task::spawn_blocking(desktopd::DesktopIndex::from_xdg).await?;
     // Real window/desktop state when the desktop is reachable; empty otherwise,
     // so this stays usable over SSH.
     let windows = desktopd::windows::WindowCtl::new()

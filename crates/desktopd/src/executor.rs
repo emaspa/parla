@@ -2,18 +2,19 @@
 //! the fast-path router directly (Rust) and later by the MCP server (plan §1:
 //! "one implementation, two callers").
 //!
-//! Resolution and action are separate steps: `resolve_window` finds a target
+//! Resolution and action are separate steps: `resolve_target` finds a window
 //! and the `*_window_id` verbs act on it, so a confirmation flow (or an MCP
 //! caller) can look at what would happen before it happens. `execute` glues
-//! the two together for intents that were already confirmed.
+//! the two together for a [`Command`] that was already confirmed.
 
 use std::sync::Arc;
 
-use parla_grammar::{DesktopIndex, Intent};
 use serde::{Deserialize, Serialize};
 use tokio::task::spawn_blocking;
 
+use crate::command::{AppTarget, Command, WindowTarget};
 use crate::config::DesktopdConfig;
+use crate::desktop::{DesktopEntry, DesktopIndex};
 use crate::injector::{self, TextInjector};
 use crate::tmuxctl::TmuxCtl;
 use crate::windows::{Window, WindowCtl};
@@ -63,6 +64,16 @@ pub enum WindowOp {
 }
 
 impl WindowOp {
+    /// The imperative, for prompts ("close").
+    pub fn verb(self) -> &'static str {
+        match self {
+            WindowOp::Focus => "focus",
+            WindowOp::Close => "close",
+            WindowOp::Minimize => "minimize",
+            WindowOp::Maximize => "maximize",
+        }
+    }
+
     fn past_tense(self) -> &'static str {
         match self {
             WindowOp::Focus => "focused",
@@ -119,59 +130,60 @@ impl Executor {
         )
     }
 
-    /// Execute a parsed fast-path intent; the summary line only.
+    /// Execute a command; the summary line only.
     ///
     /// NOTE: confirmation policy (plan §5) is the *daemon's* job — it must ask
-    /// before calling this with an intent where `needs_confirmation()` is true.
-    pub async fn execute(&self, intent: Intent) -> anyhow::Result<String> {
-        self.execute_outcome(intent).await.map(|o| o.summary)
+    /// before calling this with anything the user has to confirm.
+    pub async fn execute(&self, command: Command) -> anyhow::Result<String> {
+        self.execute_outcome(command).await.map(|o| o.summary)
     }
 
-    /// Execute a parsed fast-path intent and report what it touched.
-    pub async fn execute_outcome(&self, intent: Intent) -> anyhow::Result<Outcome> {
-        Ok(match intent {
-            Intent::LaunchApp { query } => self.launch_app(&query).await?,
-            Intent::OpenTerminal => self.open_terminal(None).await?,
-            Intent::FocusWindow { query } => self.window_op(Some(&query), WindowOp::Focus).await?,
-            Intent::CloseWindow { query } => {
-                self.window_op(query.as_deref(), WindowOp::Close).await?
-            }
-            Intent::MinimizeWindow { query } => {
-                self.window_op(query.as_deref(), WindowOp::Minimize).await?
-            }
-            Intent::MaximizeWindow { query } => {
-                self.window_op(query.as_deref(), WindowOp::Maximize).await?
-            }
-            Intent::VirtualDesktop { n } => {
+    /// Execute a command and report what it touched.
+    pub async fn execute_outcome(&self, command: Command) -> anyhow::Result<Outcome> {
+        Ok(match command {
+            Command::LaunchApp { app } => match app {
+                AppTarget::Query(query) => self.launch_app(&query).await?,
+                AppTarget::Entry(id) => {
+                    let entry = self
+                        .index
+                        .by_id(&id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("no application with id {id:?}"))?;
+                    self.launch_entry(entry).await?
+                }
+            },
+            Command::OpenTerminal => self.open_terminal(None).await?,
+            Command::Window { op, target } => self.window_op(&target, op).await?,
+            Command::VirtualDesktop { n } => {
                 crate::kwin::switch_to(n).await?;
                 Outcome::text(format!("desktop {n}"))
             }
-            Intent::VirtualDesktopRel { delta } => {
+            Command::VirtualDesktopRel { delta } => {
                 crate::kwin::switch_rel(delta).await?;
                 Outcome::text("switched desktop")
             }
-            Intent::RunShortcut { component, action } => {
+            Command::RunShortcut { component, action } => {
                 self.run_shortcut(&component, &action).await?
             }
-            Intent::KRunner { query } => {
+            Command::KRunner { query } => {
                 crate::kwin::krunner_query(&query).await?;
                 Outcome::text(format!("krunner: {query}"))
             }
-            Intent::StartClaude { model } => self.start_claude(model.as_deref()).await?,
-            Intent::ClaudeModel { model } => {
+            Command::StartClaude { model } => self.start_claude(model.as_deref()).await?,
+            Command::ClaudeModel { model } => {
                 self.tmux().switch_model(&model).await?;
                 Outcome::text(format!("claude model -> {model}"))
             }
-            Intent::ClaudeTell { text } => {
+            Command::ClaudeTell { text } => {
                 self.tmux().send(&text).await?;
                 Outcome::text("sent to claude")
             }
-            Intent::ClaudeRead => Outcome::text(self.tmux().read_tail(40).await?),
-            Intent::Notify { text } => {
+            Command::ClaudeRead => Outcome::text(self.tmux().read_tail(40).await?),
+            Command::Notify { text } => {
                 crate::notify::notify("parla", &text).await?;
                 Outcome::text("notified")
             }
-            Intent::Key { chord } => self.key(&chord).await?,
+            Command::Key { chord } => self.key(&chord).await?,
         })
     }
 
@@ -224,7 +236,7 @@ impl Executor {
         &self.index
     }
 
-    pub fn resolve_app(&self, query: &str) -> anyhow::Result<parla_grammar::DesktopEntry> {
+    pub fn resolve_app(&self, query: &str) -> anyhow::Result<DesktopEntry> {
         self.index
             .lookup(query)
             .cloned()
@@ -238,14 +250,13 @@ impl Executor {
         self.windows.find(query).await
     }
 
-    /// The target of a window intent: the named window, or the focused one
-    /// when the query is empty or just "window".
-    pub async fn target_window(&self, query: Option<&str>) -> anyhow::Result<Window> {
-        match query {
-            Some(q) if !q.trim().is_empty() && q.trim() != "window" => {
-                self.resolve_window(q).await
-            }
-            _ => self
+    /// The window a target denotes right now, without touching it. An id
+    /// that is no longer open is an error, not a stale window.
+    pub async fn resolve_target(&self, target: &WindowTarget) -> anyhow::Result<Window> {
+        match target {
+            WindowTarget::Query(q) => self.resolve_window(q).await,
+            WindowTarget::Id(id) => self.windows.window_info(id).await,
+            WindowTarget::Focused => self
                 .windows
                 .active()
                 .await?
@@ -257,6 +268,11 @@ impl Executor {
 
     pub async fn launch_app(&self, query: &str) -> anyhow::Result<Outcome> {
         let entry = self.resolve_app(query)?;
+        self.launch_entry(entry).await
+    }
+
+    /// Launch (or, with `focus_if_running`, focus) one indexed entry.
+    pub async fn launch_entry(&self, entry: DesktopEntry) -> anyhow::Result<Outcome> {
         if self.cfg.focus_if_running {
             let stem = entry.id.trim_end_matches(".desktop");
             let class = stem.rsplit('.').next().unwrap_or(stem).to_lowercase();
@@ -292,9 +308,9 @@ impl Executor {
         Ok(Outcome::text(format!("opened {}", self.cfg.terminal)))
     }
 
-    /// Resolve `query` (or the focused window) and apply `op`.
-    pub async fn window_op(&self, query: Option<&str>, op: WindowOp) -> anyhow::Result<Outcome> {
-        let w = self.target_window(query).await?;
+    /// Resolve `target` and apply `op`.
+    pub async fn window_op(&self, target: &WindowTarget, op: WindowOp) -> anyhow::Result<Outcome> {
+        let w = self.resolve_target(target).await?;
         self.window_op_id(&w.id, op).await?;
         Ok(Outcome::on_window(
             format!("{} {}", op.past_tense(), truncate(&w.title, 60)),
@@ -313,11 +329,13 @@ impl Executor {
     }
 
     pub async fn focus_window(&self, query: &str) -> anyhow::Result<Outcome> {
-        self.window_op(Some(query), WindowOp::Focus).await
+        self.window_op(&WindowTarget::Query(query.into()), WindowOp::Focus)
+            .await
     }
 
     pub async fn close_window(&self, query: Option<&str>) -> anyhow::Result<Outcome> {
-        self.window_op(query, WindowOp::Close).await
+        self.window_op(&WindowTarget::from_query(query), WindowOp::Close)
+            .await
     }
 
     pub async fn focus_window_id(&self, id: &str) -> anyhow::Result<()> {

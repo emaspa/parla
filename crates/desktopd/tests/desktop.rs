@@ -1,4 +1,4 @@
-use parla_grammar::{DesktopIndex, Grammar, Intent};
+use desktopd::DesktopIndex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -8,7 +8,7 @@ impl Fixture {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "parla-grammar-regression-{}-{}",
+            "parla-desktop-regression-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -76,10 +76,8 @@ fn lookup_requires_content_tokens() {
         index.shortlist("bring up fire fox for me", 8)[0].name,
         "Firefox"
     );
-    let Some(Intent::LaunchApp { query }) = Grammar::builtin().parse("open firefox please") else {
-        panic!("expected launch");
-    };
-    assert_eq!(index.lookup(&query).unwrap().name, "Firefox");
+    assert_eq!(index.by_id("firefox.desktop").unwrap().name, "Firefox");
+    assert!(index.by_id("firefox").is_none());
 }
 
 #[test]

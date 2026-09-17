@@ -1,3 +1,7 @@
+//! Installed applications: the `.desktop` index and fuzzy lookup for spoken
+//! queries. Runtime state about this machine, not grammar, so it lives next
+//! to the launcher that consumes it.
+
 use std::path::{Path, PathBuf};
 
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -66,8 +70,35 @@ fn can_execute(binary: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| executable(&dir.join(binary))))
 }
 
+/// Lowercase words with punctuation stripped, keeping inner apostrophes
+/// ("kate's"). Whisper transcripts arrive with case and commas; entry names
+/// are matched without them.
+fn normalize(text: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    for fragment in text.split_whitespace() {
+        let mut word = String::new();
+        let mut chars = fragment.char_indices().peekable();
+        let mut prev_alpha = false;
+        while let Some((_, c)) = chars.next() {
+            let inner_apostrophe = c == '\''
+                && prev_alpha
+                && chars.peek().is_some_and(|(_, next)| next.is_alphabetic());
+            if c.is_alphanumeric() || inner_apostrophe {
+                word.extend(c.to_lowercase());
+            } else if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            prev_alpha = c.is_alphabetic();
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+    }
+    words.join(" ")
+}
+
 fn content_words(text: &str) -> Vec<String> {
-    let normalized = crate::normalize::normalize(text);
+    let normalized = normalize(text);
     let mut words = normalized.split_whitespace().peekable();
     let mut content = Vec::new();
     while let Some(word) = words.next() {
@@ -247,6 +278,13 @@ impl DesktopIndex {
 
     pub fn entries(&self) -> &[DesktopEntry] {
         &self.entries
+    }
+
+    /// The entry with exactly this desktop id, for callers that chose one
+    /// from [`Self::entries`] or [`Self::shortlist`] earlier and want it
+    /// back without a second fuzzy match.
+    pub fn by_id(&self, id: &str) -> Option<&DesktopEntry> {
+        self.entries.iter().find(|e| e.id == id)
     }
 
     /// Plausible entries for a whole utterance, best first.
@@ -437,6 +475,16 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalize_strips_punctuation_and_case() {
+        assert_eq!(normalize("Open Firefox, please!"), "open firefox please");
+        assert_eq!(
+            normalize("don't close Kate's window"),
+            "don't close kate's window"
+        );
+        assert_eq!(normalize("  focus   firefox  "), "focus firefox");
     }
 
     #[test]

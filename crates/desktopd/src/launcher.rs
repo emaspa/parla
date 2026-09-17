@@ -4,9 +4,8 @@
 
 use std::time::Duration;
 
-use parla_grammar::DesktopEntry;
-
 use crate::config::DesktopdConfig;
+use crate::desktop::DesktopEntry;
 use crate::proc::{which, Cmd, ProcError};
 
 /// kioclient exits once the app is spawned; gtk-launch likewise. Past this,

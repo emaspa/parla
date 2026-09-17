@@ -7,7 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-parla-grammar = { path = "../grammar" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

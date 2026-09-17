@@ -286,7 +286,6 @@ dependencies = [
  "anyhow",
  "fuzzy-matcher",
  "libc",
- "parla-grammar",
  "reis",
  "serde",
  "serde_json",
@@ -1066,11 +1065,9 @@ name = "parla-grammar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "fuzzy-matcher",
  "serde",
  "toml",
  "tracing",
- "unicase",
 ]
 
 [[package]]
@@ -1900,12 +1897,6 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "unicase"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

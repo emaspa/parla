@@ -3,12 +3,10 @@
 //! phrases are data, not code.
 
 pub mod builtin;
-pub mod desktop;
 pub mod intent;
 pub mod normalize;
 pub mod pattern;
 
-pub use desktop::{DesktopEntry, DesktopIndex};
 pub use intent::Intent;
 pub use pattern::RuleDef;
 

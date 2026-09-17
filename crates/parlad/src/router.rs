@@ -10,8 +10,8 @@ pub mod policy;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use desktopd::{Executor, Window};
-use parla_grammar::{DesktopIndex, Grammar, Intent};
+use desktopd::{DesktopIndex, Executor, Window};
+use parla_grammar::{Grammar, Intent};
 
 use crate::judge::{Context, Judge, Verdict};
 use policy::{Decision, Policy, Signals};
@@ -108,7 +108,10 @@ impl Router {
         if let Some(intent) = self.grammar.parse(transcript) {
             self.gate("fast path", &intent, &Signals::Grammar)?;
             tracing::info!("fast path: {intent:?}");
-            return self.executor.execute(intent).await;
+            return self
+                .executor
+                .execute(crate::command::from_intent(intent))
+                .await;
         }
 
         // Grammar matches literal word sequences, so anything phrased outside
@@ -139,7 +142,9 @@ impl Router {
                     resolved.confidence,
                     resolved.window_id
                 );
-                self.executor.execute(resolved.intent).await
+                self.executor
+                    .execute(crate::command::from_intent(resolved.intent))
+                    .await
             }
             Verdict::Dictation => {
                 anyhow::bail!(

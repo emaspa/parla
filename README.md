@@ -20,11 +20,23 @@ Two hotkeys, both push-to-talk. `Ctrl+Space` dictates, and parla types the
 transcript into whatever has focus. `Ctrl+Shift+Space` commands, and the router
 parses the transcript into an action.
 
-The router tries the cheap path first. A grammar of 39 literal patterns matches
+The router tries the cheap path first. A grammar of 42 literal patterns matches
 `open firefox` or `desktop two` without leaving the process. Anything phrased
 outside those patterns falls through to the judged path, which asks a TypeSafe
 System One model for the intent and its arguments in one request. What neither
 path can resolve, parla refuses out loud instead of guessing.
+
+Either path ends in the same policy, and what the policy wants confirmed
+waits for a spoken answer. parla resolves the target first, so the prompt
+names the window rather than the words: "Close 'build — Konsole'? say yes".
+The next command-mode utterance is matched against a short list of replies
+before anything else. `yes`, `confirm`, `do it` or `go ahead` run the command;
+`no`, `cancel`, `stop` or `never mind` drop it; any other command drops it
+too, since the user has moved on. A yes is honoured for eight seconds
+(`router.confirm_window_ms`) and only if the target is still the window the
+prompt named. parla resolves the query again and requires the same window id.
+A window that closed, or a focus that moved in the meantime, refuses instead
+of closing something else. Dictation in between leaves the prompt alone.
 
 ## The judged path
 
@@ -72,16 +84,24 @@ The path is off by default. Turn it on with `enabled = true` under
 `[typesafe]` and export `TYPESAFE_API_KEY`. parlad reads the key from the
 environment ahead of the config file, so it never has to touch disk. The
 request carries the utterance, the installed application names, and for each
-open window its application and an index. Window titles stay on this machine
-unless `send_window_titles = true`.
+open window its application class and an index. Window titles stay on this
+machine unless `send_window_titles = true`; the model picks an index and the
+title is mapped back here.
+
+The judge remembers which window or `.desktop` entry a candidate came from,
+and that id is what gets executed. The title is never fuzzy-matched a second
+time, so two windows with the same caption cannot swap places between judging
+and acting.
 
 ```
 parlad --judge "bring the file manager to the front"
 ```
 
 runs one utterance end to end and prints what would happen without doing it.
-The default config ships hand-picked thresholds, and this is how to replace them
-with measured ones.
+It builds the same executor and takes the same snapshot the daemon would, so
+the windows and desktops it reasons about are the live ones, and it prints the
+command it would run and the policy's decision. The default config ships
+hand-picked thresholds, and this is how to replace them with measured ones.
 
 ## Requirements
 
@@ -103,9 +123,15 @@ probe fails. Launching tries `kioclient`, then `gtk-launch`, then
 cargo build --release
 ```
 
-Put a whisper model where the config expects one. Two error messages point at
-`scripts/fetch-model.sh`, which does not exist yet, so download a
-`ggml-large-v3-turbo.bin` from the whisper.cpp model releases by hand.
+Put a whisper model where the config expects one:
+
+```
+scripts/fetch-model.sh
+```
+
+downloads `ggml-large-v3-turbo.bin` from the whisper.cpp model releases into
+`~/.local/share/parla/models`, resumably, and is a no-op once the file is
+there. Pass another model name to fetch that one instead.
 
 Write a config, then check the environment before starting the daemon:
 
@@ -119,23 +145,30 @@ devices, probes the injectors, counts visible windows and virtual desktops, and
 tries one `.desktop` lookup. It registers no hotkeys and loads no model, so it
 is safe to run against a live session.
 
+Only one parlad runs per session. It takes a lock on
+`$XDG_STATE_HOME/parla/parlad.lock` at startup, and a second instance exits
+with a message naming the first. Two daemons would register the same hotkeys
+and both type every utterance. A hotkey held longer than `audio.max_hold_ms`
+(30 s by default) counts as released, so a lost release event cannot record
+for ever. parlad finishes the capture and processes it as if the key had come
+up.
+
 ## Layout
 
 | crate | what it holds |
 | --- | --- |
-| `parla-grammar` | Intents, the literal-pattern grammar, `.desktop` indexing and fuzzy lookup |
-| `desktopd` | The executor: windows, launching, virtual desktops, tmux, text injection |
-| `parlad` | The daemon: capture, VAD, ASR, hotkeys, router, judged path |
+| `parla-grammar` | Intents and the literal-pattern grammar, including the confirm/deny replies |
+| `desktopd` | The executor and its `Command` vocabulary: windows, launching, the `.desktop` index, virtual desktops, tmux, text injection |
+| `parlad` | The daemon: capture, VAD, ASR, hotkeys, router, policy, confirmation, judged path |
 
-`desktopd` is one implementation with two callers. The router calls it directly
-as a Rust library today, and its shape lets an MCP server expose the same
-commands later.
+`desktopd` is one implementation with two callers. It executes its own
+`Command` type, whose window targets are a query, a window id or the focused
+window, and it does not depend on the grammar; parlad maps intents onto
+commands. The router calls it directly as a Rust library today, and its shape
+lets an MCP server expose the same commands later.
 
 ## Not done yet
 
-- **Spoken confirmation.** The router recognizes destructive intents and then
-  refuses them, because nothing can confirm them yet. `close window` does not
-  work.
 - **The judged path's thresholds are guesses.** They are hand-picked defaults.
   Nobody has checked them against a corpus of real utterances.
 - **The energy gate is not a VAD.** It trims silence and rejects stray taps by

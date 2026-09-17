@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsFd, FromRawFd};
 
 use zbus::zvariant::{Fd, OwnedValue, Value};
-use zbus::Connection;
+use crate::bus;
 
 const SERVICE: &str = "org.kde.KWin.ScreenShot2";
 const PATH: &str = "/org/kde/KWin/ScreenShot2";
@@ -29,7 +29,7 @@ impl Screenshot {
     /// needed.
     pub fn write_ppm(&self, path: &std::path::Path) -> anyhow::Result<()> {
         anyhow::ensure!(
-            matches!(self.format, 4 | 5 | 6),
+            matches!(self.format, 4..=6),
             "unsupported QImage format {} (expected RGB32/ARGB32 family)",
             self.format
         );
@@ -48,7 +48,7 @@ impl Screenshot {
 }
 
 pub async fn capture_active_window() -> anyhow::Result<Screenshot> {
-    let conn = Connection::session().await?;
+    let conn = bus::session().await?;
 
     // anonymous in-memory buffer for KWin to write pixels into
     let raw = unsafe { libc::memfd_create(c"parla-shot".as_ptr(), libc::MFD_CLOEXEC) };

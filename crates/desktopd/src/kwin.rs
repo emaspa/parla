@@ -1,7 +1,8 @@
 //! KWin D-Bus: virtual desktops (VirtualDesktopManager) and KRunner.
 
 use zbus::proxy;
-use zbus::Connection;
+
+use crate::bus;
 
 #[proxy(
     interface = "org.kde.KWin.VirtualDesktopManager",
@@ -21,35 +22,53 @@ trait VirtualDesktopManager {
     fn navigation_wrapping_around(&self) -> zbus::Result<bool>;
 }
 
-pub async fn list_desktops() -> anyhow::Result<Vec<(u32, String, String)>> {
-    let conn = Connection::session().await?;
-    let vdm = VirtualDesktopManagerProxy::new(&conn).await?;
+async fn vdm() -> anyhow::Result<VirtualDesktopManagerProxy<'static>> {
+    let conn = bus::session().await?;
+    Ok(VirtualDesktopManagerProxy::new(&conn).await?)
+}
+
+async fn sorted_desktops(
+    vdm: &VirtualDesktopManagerProxy<'_>,
+) -> anyhow::Result<Vec<(u32, String, String)>> {
     let mut desktops = vdm.desktops().await?;
     desktops.sort_by_key(|(pos, _, _)| *pos);
     Ok(desktops)
 }
 
-/// 1-based number of the current desktop.
-pub async fn current_desktop() -> anyhow::Result<u32> {
-    let conn = Connection::session().await?;
-    let vdm = VirtualDesktopManagerProxy::new(&conn).await?;
+pub async fn list_desktops() -> anyhow::Result<Vec<(u32, String, String)>> {
+    sorted_desktops(&vdm().await?).await
+}
+
+/// (1-based current desktop, desktop count) in one round of calls.
+pub async fn desktop_position() -> anyhow::Result<(u32, u32)> {
+    let vdm = vdm().await?;
     let current = vdm.current().await?;
-    let desktops = list_desktops().await?;
+    let desktops = sorted_desktops(&vdm).await?;
     let idx = desktops
         .iter()
         .position(|(_, id, _)| *id == current)
         .ok_or_else(|| anyhow::anyhow!("current desktop {current} not in the desktop list"))?;
-    Ok(idx as u32 + 1)
+    Ok((idx as u32 + 1, desktops.len() as u32))
+}
+
+/// 1-based number of the current desktop.
+pub async fn current_desktop() -> anyhow::Result<u32> {
+    desktop_position().await.map(|(cur, _)| cur)
 }
 
 /// Switch to the 1-based desktop number n.
 pub async fn switch_to(n: u32) -> anyhow::Result<()> {
-    let conn = Connection::session().await?;
-    let vdm = VirtualDesktopManagerProxy::new(&conn).await?;
-    let desktops = list_desktops().await?;
-    let (_, id, name) = desktops
-        .get(n as usize - 1)
-        .ok_or_else(|| anyhow::anyhow!("desktop {n} does not exist (have {})", desktops.len()))?;
+    let vdm = vdm().await?;
+    let desktops = sorted_desktops(&vdm).await?;
+    let (_, id, name) = n
+        .checked_sub(1)
+        .and_then(|i| desktops.get(i as usize))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "desktop {n} does not exist (valid range: 1 to {})",
+                desktops.len()
+            )
+        })?;
     vdm.set_current(id).await?;
     tracing::info!("switched to desktop {n} ({name})");
     Ok(())
@@ -57,9 +76,8 @@ pub async fn switch_to(n: u32) -> anyhow::Result<()> {
 
 /// Switch relative to the current desktop (+1/-1, wrapping per KWin setting).
 pub async fn switch_rel(delta: i32) -> anyhow::Result<()> {
-    let conn = Connection::session().await?;
-    let vdm = VirtualDesktopManagerProxy::new(&conn).await?;
-    let desktops = list_desktops().await?;
+    let vdm = vdm().await?;
+    let desktops = sorted_desktops(&vdm).await?;
     anyhow::ensure!(!desktops.is_empty(), "no virtual desktops");
     let current = vdm.current().await?;
     let idx = desktops
@@ -82,7 +100,7 @@ pub async fn switch_rel(delta: i32) -> anyhow::Result<()> {
 
 /// Open KRunner pre-filled with a query.
 pub async fn krunner_query(term: &str) -> anyhow::Result<()> {
-    let conn = Connection::session().await?;
+    let conn = bus::session().await?;
     conn.call_method(
         Some("org.kde.krunner"),
         "/App",

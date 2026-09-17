@@ -1,7 +1,7 @@
 //! Fire any existing KDE global shortcut through kglobalaccel's component
 //! objects (e.g. Spectacle's ActiveWindowScreenShot) without knowing its key.
 
-use zbus::Connection;
+use crate::bus;
 
 /// Component unique names map to object paths with dots/dashes replaced:
 /// `org_kde_spectacle_desktop` -> `/component/org_kde_spectacle_desktop`.
@@ -10,7 +10,7 @@ fn component_path(component: &str) -> String {
 }
 
 pub async fn invoke(component: &str, action: &str) -> anyhow::Result<()> {
-    let conn = Connection::session().await?;
+    let conn = bus::session().await?;
     conn.call_method(
         Some("org.kde.kglobalaccel"),
         component_path(component).as_str(),
@@ -28,7 +28,7 @@ pub async fn invoke(component: &str, action: &str) -> anyhow::Result<()> {
 /// List a component's shortcut names (useful for config authoring and the
 /// agent's tool inventory).
 pub async fn shortcut_names(component: &str) -> anyhow::Result<Vec<String>> {
-    let conn = Connection::session().await?;
+    let conn = bus::session().await?;
     let reply = conn
         .call_method(
             Some("org.kde.kglobalaccel"),

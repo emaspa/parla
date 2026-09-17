@@ -2,12 +2,14 @@
 //! surface (plan §1), exposed as a Rust library for the daemon's fast path
 //! and — in P3 — as an MCP server for the agent path.
 
+pub mod bus;
 pub mod config;
 pub mod executor;
 pub mod injector;
 pub mod kwin;
 pub mod launcher;
 pub mod notify;
+pub mod proc;
 pub mod screenshot;
 pub mod shortcuts;
 pub mod tmuxctl;

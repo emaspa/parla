@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use zbus::Connection;
+use crate::bus;
 
 pub async fn notify(summary: &str, body: &str) -> anyhow::Result<()> {
-    let conn = Connection::session().await?;
+    let conn = bus::session().await?;
     let actions: Vec<&str> = vec![];
     let hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
     conn.call_method(

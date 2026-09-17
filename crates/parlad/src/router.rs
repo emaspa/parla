@@ -1,12 +1,20 @@
 //! The router: dictation commits straight to the focused window; commands go
 //! through the fast-path grammar first and fall through to the judged path.
+//! Both paths end in the same [`Policy`] decision.
+
+// Declared here rather than in main.rs so the module list there stays the
+// daemon's; `mod policy;` in main.rs can replace this line later.
+#[path = "policy.rs"]
+pub mod policy;
 
 use std::sync::Arc;
 
-use desktopd::Executor;
-use parla_grammar::Grammar;
+use anyhow::Context as _;
+use desktopd::{Executor, Window};
+use parla_grammar::{DesktopIndex, Grammar, Intent};
 
-use crate::judge::{Context, Judge, Judgment};
+use crate::judge::{Context, Judge, Verdict};
+use policy::{Decision, Policy, Signals};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -16,18 +24,49 @@ pub enum Mode {
     Command,
 }
 
+/// Observed desktop state at one moment, gathered before judging. Every field
+/// is a fact that was actually read; a query that fails refuses the judged
+/// path instead of standing in a made-up value.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub windows: Vec<Window>,
+    pub current_desktop: u32,
+    pub desktop_count: u32,
+    pub claude_running: bool,
+}
+
+impl Snapshot {
+    pub fn context<'a>(&'a self, index: &'a DesktopIndex) -> Context<'a> {
+        Context {
+            windows: &self.windows,
+            index,
+            current_desktop: self.current_desktop,
+            desktop_count: self.desktop_count,
+            claude_running: self.claude_running,
+        }
+    }
+}
+
 pub struct Router {
     executor: Arc<Executor>,
     grammar: Arc<Grammar>,
     judge: Option<Arc<Judge>>,
+    policy: Policy,
 }
 
 impl Router {
+    /// The policy comes from the judge's config when there is one, so both
+    /// paths share thresholds. Without a judge only grammar matches reach
+    /// the gate, and those need no threshold.
     pub fn new(executor: Arc<Executor>, grammar: Arc<Grammar>, judge: Option<Arc<Judge>>) -> Self {
+        let policy = judge
+            .as_ref()
+            .map_or_else(Policy::default, |j| j.policy().clone());
         Self {
             executor,
             grammar,
             judge,
+            policy,
         }
     }
 
@@ -42,15 +81,32 @@ impl Router {
         }
     }
 
+    /// Read the state the judged path needs. Public so `parlad --judge` can
+    /// use the same observation instead of its own copy.
+    pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+        let windows = self
+            .executor
+            .list_windows()
+            .await
+            .context("cannot judge without the window list")?;
+        let desktops = desktopd::kwin::list_desktops()
+            .await
+            .context("cannot judge without the virtual desktop list")?;
+        anyhow::ensure!(!desktops.is_empty(), "KWin reports no virtual desktops");
+        let current_desktop = desktopd::kwin::current_desktop()
+            .await
+            .context("cannot judge without knowing the current desktop")?;
+        Ok(Snapshot {
+            windows,
+            current_desktop,
+            desktop_count: desktops.len() as u32,
+            claude_running: self.executor.tmux().session_exists().await,
+        })
+    }
+
     async fn route_command(&self, transcript: &str) -> anyhow::Result<String> {
         if let Some(intent) = self.grammar.parse(transcript) {
-            if intent.needs_confirmation() {
-                // P2 wires spoken confirmation; until then refuse loudly
-                // rather than execute destructive verbs unconfirmed.
-                anyhow::bail!(
-                    "intent {intent:?} needs confirmation (spoken-confirm flow lands in P2); not executed"
-                );
-            }
+            self.gate("fast path", &intent, &Signals::Grammar)?;
             tracing::info!("fast path: {intent:?}");
             return self.executor.execute(intent).await;
         }
@@ -66,54 +122,47 @@ impl Router {
     async fn route_judged(&self, judge: &Judge, transcript: &str) -> anyhow::Result<String> {
         // Observed facts the judgment needs. Gathered here rather than inside
         // the judge so the judge stays a pure function of the state it is
-        // given, and so a failure to list windows is a router error.
-        let windows = self.executor.list_windows().await.unwrap_or_else(|e| {
-            tracing::warn!("window list unavailable for judging: {e:#}");
-            Vec::new()
-        });
-        let (current_desktop, desktop_count) = match desktopd::kwin::list_desktops().await {
-            Ok(d) => (
-                desktopd::kwin::current_desktop().await.unwrap_or(1),
-                d.len() as u32,
-            ),
-            Err(e) => {
-                tracing::warn!("desktop list unavailable for judging: {e:#}");
-                (1, 1)
-            }
-        };
-        let ctx = Context {
-            windows: &windows,
-            index: self.executor.desktop_index(),
-            current_desktop,
-            desktop_count,
-            claude_running: self.executor.tmux().session_exists().await,
-        };
+        // given, and so a failure to observe is a router error, not a fact.
+        let snapshot = self.snapshot().await?;
+        let ctx = snapshot.context(self.executor.desktop_index());
 
-        match judge.judge(transcript, &ctx).await? {
-            Judgment::Act {
-                intent,
-                confidence,
-                needs_confirmation,
-            } => {
-                if needs_confirmation {
-                    // Same gate as the fast path: voice is an unauthenticated
-                    // input channel, so nothing risky runs unconfirmed.
-                    anyhow::bail!(
-                        "judged {intent:?} at confidence {confidence:.2} needs confirmation \
-                         (spoken-confirm flow lands in P2); not executed"
-                    );
-                }
-                tracing::info!("judged path: {intent:?} (confidence {confidence:.2})");
-                self.executor.execute(intent).await
+        match judge.judge_verdict(transcript, &ctx).await? {
+            Verdict::Act(resolved) => {
+                self.gate(
+                    &format!("judged (confidence {:.2})", resolved.confidence),
+                    &resolved.intent,
+                    &resolved.signals,
+                )?;
+                tracing::info!(
+                    "judged path: {:?} (confidence {:.2}, window {:?})",
+                    resolved.intent,
+                    resolved.confidence,
+                    resolved.window_id
+                );
+                self.executor.execute(resolved.intent).await
             }
-            Judgment::Dictation => {
+            Verdict::Dictation => {
                 anyhow::bail!(
                     "that sounded like dictation, not a command — hold the dictate hotkey instead"
                 )
             }
-            Judgment::Unclear(reason) => {
+            Verdict::Unclear(reason) => {
                 anyhow::bail!("could not act on {transcript:?}: {reason}")
             }
+        }
+    }
+
+    /// The single confirmation gate. Voice is an unauthenticated input
+    /// channel, so nothing the policy wants confirmed runs unconfirmed; until
+    /// the spoken-confirm flow lands (P2) that means refusing loudly.
+    fn gate(&self, source: &str, intent: &Intent, signals: &Signals) -> anyhow::Result<()> {
+        match self.policy.decide(intent, signals) {
+            Decision::Act => Ok(()),
+            Decision::Confirm { reason } => anyhow::bail!(
+                "{source} {intent:?} needs confirmation ({reason}); \
+                 spoken-confirm flow lands in P2, not executed"
+            ),
+            Decision::Refuse { reason } => anyhow::bail!("{source} {intent:?} refused: {reason}"),
         }
     }
 }

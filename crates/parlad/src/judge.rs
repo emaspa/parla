@@ -10,7 +10,10 @@
 //! Code still owns everything code is good at: which apps are installed, which
 //! windows are open, how many desktops exist, and what counts as confident
 //! enough to act. The model only supplies the semantic step — which of the
-//! candidates the user meant.
+//! candidates the user meant. Every candidate is offered under an opaque key
+//! (`a:3`, `w:0`, `p:2`) with the human-readable value in its description, so
+//! a window titled `__none__` can never be mistaken for the no-match option,
+//! and every returned choice is checked against what was offered.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,29 +21,61 @@ use parla_grammar::{DesktopIndex, Intent};
 use serde_json::json;
 
 use crate::config::TypeSafeConfig;
-use crate::typesafe::{Client, NoulCriteria, Question, Response};
+use crate::router::policy::{Decision, Policy, Signals};
+use crate::typesafe::{Client, NoulCriteria, Question, Response, MAX_CHOICE_OPTIONS};
 use desktopd::windows::Window;
 
-/// Sentinel option names. Prefixed so they can never collide with a real app
-/// name or window title.
+/// Sentinel option names. Real candidates use `a:`/`w:`/`p:` keys, so these
+/// cannot collide with anything observed.
 const NO_TARGET: &str = "__none__";
 const FOCUSED: &str = "__focused_window__";
+
+/// Opaque key prefixes for observed candidates.
+const APP_KEY: &str = "a:";
+const WINDOW_KEY: &str = "w:";
+const SPAN_KEY: &str = "p:";
 
 /// How many installed apps to offer as candidates. The model cannot pick a
 /// value we omit, so this is the one number that decides whether an app is
 /// reachable by voice at all.
 const APP_CANDIDATES: usize = 24;
+/// How many open windows to offer. Windows come first in the list kdotool
+/// returns, so a cluttered desktop loses its oldest windows, not its newest.
+const WINDOW_CANDIDATES: usize = 96;
+/// How many trailing words of the utterance may start a payload. Bounds both
+/// the option count and the total text sent (each span is at most the
+/// utterance's tail, so the sum is linear in this constant).
+const PAYLOAD_SPANS: usize = 64;
+
+/// How many numbered desktops to offer. KWin itself stops at 20, so this
+/// only matters for keeping the question under the API's limit.
+const DESKTOP_CANDIDATES: u32 = (MAX_CHOICE_OPTIONS - 1) as u32;
+
+const _: () = assert!(APP_CANDIDATES + WINDOW_CANDIDATES + 2 <= MAX_CHOICE_OPTIONS);
+const _: () = assert!(PAYLOAD_SPANS < MAX_CHOICE_OPTIONS);
+
+/// An intent the judged path built, plus the signals the policy needs to
+/// decide whether it may run. The decision itself is the router's, so both
+/// paths go through one gate.
+#[derive(Debug)]
+pub struct Resolved {
+    pub intent: Intent,
+    /// KWin id of the window the user named, when the target was chosen from
+    /// the open-window list. The `Intent` carries the title as a query for
+    /// now; an executor that takes ids should prefer this.
+    pub window_id: Option<String>,
+    /// Weakest link across the judgments that built the intent.
+    pub confidence: f64,
+    /// What the model said about risk and dictation, for [`Policy::decide`].
+    pub signals: Signals,
+}
 
 /// What the judged path concluded.
 #[derive(Debug)]
-pub enum Judgment {
-    /// Act on this. `confidence` is the weakest link across the judgments that
-    /// built it; `needs_confirmation` folds in the risk judgment.
-    Act {
-        intent: Intent,
-        confidence: f64,
-        needs_confirmation: bool,
-    },
+pub enum Verdict {
+    /// An intent was built. Whether it runs, asks, or is refused is
+    /// [`Policy::decide`]'s call.
+    Act(Resolved),
     /// The user was dictating prose, not commanding — they are holding the
     /// wrong hotkey.
     Dictation,
@@ -48,9 +83,41 @@ pub enum Judgment {
     Unclear(String),
 }
 
+/// Flattened view of a [`Verdict`], kept for `parlad --judge` until main.rs
+/// adopts `Verdict` (it loses the window id and the confirmation reason).
+#[derive(Debug)]
+pub enum Judgment {
+    Act {
+        intent: Intent,
+        confidence: f64,
+        needs_confirmation: bool,
+    },
+    Dictation,
+    Unclear(String),
+}
+
+impl Verdict {
+    /// Apply the policy and flatten: a refusal becomes `Unclear`.
+    pub fn flatten(self, policy: &Policy) -> Judgment {
+        match self {
+            Verdict::Act(r) => match policy.decide(&r.intent, &r.signals) {
+                Decision::Refuse { reason } => Judgment::Unclear(reason),
+                decision => Judgment::Act {
+                    intent: r.intent,
+                    confidence: r.confidence,
+                    needs_confirmation: matches!(decision, Decision::Confirm { .. }),
+                },
+            },
+            Verdict::Dictation => Judgment::Dictation,
+            Verdict::Unclear(s) => Judgment::Unclear(s),
+        }
+    }
+}
+
 pub struct Judge {
     client: Client,
     cfg: TypeSafeConfig,
+    policy: Policy,
 }
 
 /// Context code gathers before asking. Everything here is observed fact, kept
@@ -71,241 +138,313 @@ impl Judge {
             cfg.model.clone(),
             std::time::Duration::from_millis(cfg.timeout_ms),
         )?;
-        Ok(Self { client, cfg })
+        let policy = Policy::from(&cfg);
+        Ok(Self {
+            client,
+            cfg,
+            policy,
+        })
     }
 
-    pub async fn judge(&self, utterance: &str, ctx: &Context<'_>) -> anyhow::Result<Judgment> {
-        let candidates = Candidates::build(utterance, ctx);
-        let state = json!({
-            "utterance": utterance,
-            "open_windows": ctx.windows.iter().map(|w| json!({
-                "title": w.title,
-                "application": w.class,
-            })).collect::<Vec<_>>(),
-            "current_desktop": ctx.current_desktop,
-            "desktop_count": ctx.desktop_count,
-            "claude_code_session_running": ctx.claude_running,
-        });
+    /// The thresholds this judge applies, so the router can gate the fast
+    /// path with the same ones.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
 
-        let questions = candidates.questions(ctx);
+    pub async fn judge_verdict(&self, utterance: &str, ctx: &Context<'_>) -> anyhow::Result<Verdict> {
+        let candidates = Candidates::build(utterance, ctx, &self.cfg);
+        let state = candidates.state(utterance, ctx);
+
         let t0 = std::time::Instant::now();
-        let resp = self.client.evaluate(&state, &questions).await?;
+        let resp = self.client.evaluate(&state, &candidates.questions).await?;
+        let (tokens_in, tokens_out) = resp
+            .usage
+            .as_ref()
+            .map_or((0, 0), |u| (u.input_tokens, u.output_tokens));
         tracing::info!(
-            "judged {:?} in {:.0}ms ({} in / {} out tokens)",
+            "judged {:?} in {:.0}ms ({tokens_in} in / {tokens_out} out tokens)",
             utterance,
             t0.elapsed().as_secs_f64() * 1000.0,
-            resp.usage.input_tokens,
-            resp.usage.output_tokens,
         );
 
-        Ok(compose(&resp, &self.cfg, &candidates))
+        Ok(compose(&resp, &self.policy, &candidates))
+    }
+
+    /// [`Self::judge_verdict`] with this judge's policy applied.
+    pub async fn judge(&self, utterance: &str, ctx: &Context<'_>) -> anyhow::Result<Judgment> {
+        Ok(self
+            .judge_verdict(utterance, ctx)
+            .await?
+            .flatten(&self.policy))
     }
 }
 
-/// Turn the answers into an intent. Policy lives here rather than in the
-/// questions, so thresholds can change without re-running inference — and so
-/// it can be tested against recorded answers without a network call.
-fn compose(resp: &Response, cfg: &TypeSafeConfig, candidates: &Candidates) -> Judgment {
-    if let Some(p) = resp.noul("is_dictation") {
-        if p >= cfg.dictation_threshold {
-            return Judgment::Dictation;
-        }
+/// Turn the answers into an intent plus the signals that gate it. No
+/// threshold is applied here except the dictation one, which decides what
+/// kind of answer this is at all; the rest is [`Policy::decide`], so it can
+/// be tested against recorded answers without a network call.
+fn compose(resp: &Response, policy: &Policy, cand: &Candidates) -> Verdict {
+    match build(resp, policy, cand) {
+        Ok(v) => v,
+        Err(reason) => Verdict::Unclear(reason),
+    }
+}
+
+fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict, String> {
+    let dictation = resp.noul("is_dictation");
+    let destructive = resp.noul("is_destructive");
+    if policy.is_prose(dictation) {
+        return Ok(Verdict::Dictation);
     }
 
-    let Some((name, intent_conf)) = resp.choice("intent") else {
-        return Judgment::Unclear("model returned no intent".into());
+    let (name, intent_conf) = match cand.pick(resp, "intent")? {
+        Pick::Chosen(n, c) => (n, c),
+        Pick::NoMatch(_) => return Err("not a desktop command".into()),
+        Pick::Missing => return Err("model returned no intent".into()),
     };
-    if name == NO_TARGET {
-        return Judgment::Unclear("not a desktop command".into());
-    }
-    if intent_conf < cfg.min_confidence {
-        return Judgment::Unclear(format!(
-            "unsure what {name:?} meant (confidence {intent_conf:.2})"
-        ));
-    }
-
     // Weakest link, not a product: one wrong argument spoils the action,
     // so the action is only as trustworthy as its least certain part.
     let mut confidence = intent_conf;
     let mut args: BTreeMap<String, String> = BTreeMap::new();
+    let mut window_id = None;
+    // The intent name to build; show_app resolves to launch or focus.
+    let mut build_name = name;
 
-    // Required argument: its absence means we misread the intent.
-    macro_rules! required {
-        ($id:expr, $key:expr, $map:expr) => {
-            match arg(resp, $id, &mut confidence) {
-                Some(v) => args.insert($key.into(), $map(v)),
-                None => {
-                    return Judgment::Unclear(format!("{name} without a {}", $id));
-                }
-            }
-        };
+    fn required<'a>(
+        cand: &Candidates,
+        resp: &'a Response,
+        name: &str,
+        id: &str,
+        confidence: &mut f64,
+    ) -> Result<&'a str, String> {
+        cand.arg(resp, id, confidence)?
+            .ok_or_else(|| format!("{name} without a {id}"))
     }
 
     match name {
-        "show_app" | "krunner" => {
-            required!("target", "query", |v: String| v);
-        }
-        "close_window" | "minimize_window" | "maximize_window" => {
-            // Optional query: no named target means the focused window,
-            // which is a legitimate answer rather than a failure.
-            if let Some(t) = arg(resp, "target", &mut confidence) {
-                if t != FOCUSED {
-                    args.insert("query".into(), t);
+        "show_app" => {
+            // "make this visible" splits into launch-vs-focus on an observed
+            // fact, so code decides it rather than spending model
+            // probability on the split.
+            match cand.target(cand.arg(resp, "target", &mut confidence)?) {
+                Target::Window(w) => {
+                    args.insert("query".into(), w.title.clone());
+                    window_id = Some(w.id.clone());
+                    build_name = "focus_window";
                 }
+                Target::App(app) => {
+                    args.insert("query".into(), app.to_string());
+                    build_name = "launch_app";
+                }
+                Target::Focused => {
+                    return Err("show_app pointed at the window that already has focus".into())
+                }
+                Target::Unnamed => return Err("show_app without a target".into()),
             }
         }
+        "close_window" | "minimize_window" | "maximize_window" => {
+            match cand.target(cand.arg(resp, "target", &mut confidence)?) {
+                Target::Window(w) => {
+                    args.insert("query".into(), w.title.clone());
+                    window_id = Some(w.id.clone());
+                }
+                Target::App(app) => {
+                    args.insert("query".into(), app.to_string());
+                }
+                // Only an explicit, confident choice of the focused window
+                // means "no query"; silence is not that choice.
+                Target::Focused => {}
+                Target::Unnamed => return Err(format!("{name} without a target")),
+            }
+        }
+        "krunner" => {
+            let key = required(cand, resp, name, "payload", &mut confidence)?;
+            args.insert("query".into(), cand.span(key)?.to_string());
+        }
         "virtual_desktop" => {
-            required!("desktop_number", "n", |v: String| v);
+            let key = required(cand, resp, name, "desktop_number", &mut confidence)?;
+            let n: u32 = key
+                .parse()
+                .map_err(|_| format!("desktop number {key:?} is not a number"))?;
+            if !(1..=cand.desktop_count).contains(&n) {
+                return Err(format!(
+                    "desktop {n} does not exist (this machine has {})",
+                    cand.desktop_count
+                ));
+            }
+            args.insert("n".into(), n.to_string());
         }
         "virtual_desktop_rel" => {
-            required!("desktop_direction", "delta", |v: String| {
-                if v == "previous" {
-                    "-1".to_string()
-                } else {
-                    "1".to_string()
-                }
-            });
+            let delta = match required(cand, resp, name, "desktop_direction", &mut confidence)? {
+                "next" => "1",
+                "previous" => "-1",
+                other => return Err(format!("desktop direction {other:?} is not next or previous")),
+            };
+            args.insert("delta".into(), delta.into());
         }
         "start_claude" => {
             // Optional: absent leaves the configured default model.
-            if let Some(m) = arg(resp, "claude_model", &mut confidence) {
-                args.insert("model".into(), m);
+            if let Some(m) = cand.arg(resp, "claude_model", &mut confidence)? {
+                args.insert("model".into(), m.to_string());
             }
         }
         "claude_model" => {
-            required!("claude_model", "model", |v: String| v);
+            let m = required(cand, resp, name, "claude_model", &mut confidence)?;
+            args.insert("model".into(), m.to_string());
         }
         "claude_tell" | "notify" => {
-            required!("payload", "text", |v: String| v);
+            let key = required(cand, resp, name, "payload", &mut confidence)?;
+            args.insert("text".into(), cand.span(key)?.to_string());
         }
         "key" => {
-            required!("payload", "chord", |v: String| v.replace(" plus ", " "));
+            let key = required(cand, resp, name, "payload", &mut confidence)?;
+            args.insert("chord".into(), cand.span(key)?.replace(" plus ", " "));
         }
-        // open_terminal and claude_read take no arguments.
-        _ => {}
+        "open_terminal" | "claude_read" => {}
+        other => return Err(format!("no rule to build intent {other:?}")),
     }
 
-    // "make this visible" splits into launch-vs-focus on an observed fact, so
-    // code decides it rather than spending model probability on the split.
-    let name = match name {
-        "show_app" => {
-            let target = args.get("query").map(String::as_str).unwrap_or_default();
-            if candidates.is_open_window(target) {
-                "focus_window"
-            } else {
-                "launch_app"
-            }
-        }
-        other => other,
-    };
+    let intent = Intent::from_args(build_name, &args)
+        .ok_or_else(|| format!("could not build {build_name} from {args:?}"))?;
 
-    let Some(intent) = Intent::from_args(name, &args) else {
-        return Judgment::Unclear(format!("could not build {name} from {args:?}"));
-    };
-
-    // Confirmation gates on judged consequence rather than intent shape:
-    // closing a terminal mid-build and closing a calculator are the same
-    // variant. Being *confident* about a destructive request is not
-    // permission to carry it out, so risk alone forces the prompt; low
-    // confidence forces it even for harmless actions.
-    let risky = resp
-        .noul("is_destructive")
-        .is_some_and(|p| p >= cfg.destructive_threshold);
-    let needs_confirmation =
-        risky || intent.needs_confirmation() || confidence < cfg.act_unconfirmed_above;
-
-    Judgment::Act {
+    Ok(Verdict::Act(Resolved {
         intent,
+        window_id,
         confidence,
-        needs_confirmation,
-    }
+        signals: Signals::Judged {
+            confidence,
+            destructive,
+            dictation,
+        },
+    }))
 }
 
-/// Read one chosen argument, folding its confidence into the running minimum.
-/// A no-match answer yields None rather than a bogus value — the model cannot
-/// invent an option we never offered.
-fn arg(resp: &Response, id: &str, confidence: &mut f64) -> Option<String> {
-    let (value, c) = resp.choice(id)?;
-    if value == NO_TARGET {
-        return None;
-    }
-    *confidence = confidence.min(c);
-    Some(value.to_string())
+/// One choice answer, checked against what was offered.
+enum Pick<'a> {
+    Chosen(&'a str, f64),
+    NoMatch(f64),
+    Missing,
 }
 
-/// Candidate values assembled by code, for the model to select among.
+/// What a `target` key denotes.
+enum Target<'a> {
+    App(&'a str),
+    Window(&'a Window),
+    Focused,
+    Unnamed,
+}
+
+/// Candidate values assembled by code, for the model to select among, and
+/// the questions built from them so answers can be checked against exactly
+/// what was sent.
 struct Candidates {
-    /// Option name -> what it is, for the `target` choice.
-    targets: BTreeMap<String, String>,
-    /// Which of those options are windows that already exist.
-    open_windows: BTreeSet<String>,
-    /// Trailing spans of the utterance, for verbatim payload selection.
+    /// Installed application names, keyed `a:<index>`.
+    apps: Vec<String>,
+    /// Open windows, keyed `w:<index>`.
+    windows: Vec<Window>,
+    /// Trailing spans of the utterance, keyed `p:<index>`.
     spans: Vec<String>,
+    desktop_count: u32,
+    send_window_titles: bool,
+    questions: BTreeMap<String, Question>,
+}
+
+fn indexed(key: &str, prefix: &str) -> Option<usize> {
+    key.strip_prefix(prefix)?.parse().ok()
 }
 
 impl Candidates {
-    fn is_open_window(&self, target: &str) -> bool {
-        self.open_windows.contains(target)
-    }
-
-    #[cfg(test)]
-    fn with_open_windows(titles: &[&str]) -> Self {
-        Self {
-            targets: BTreeMap::new(),
-            open_windows: titles.iter().map(|t| (*t).to_string()).collect(),
-            spans: Vec::new(),
-        }
-    }
-}
-
-impl Candidates {
-    fn build(utterance: &str, ctx: &Context<'_>) -> Self {
-        let mut targets = BTreeMap::new();
+    fn build(utterance: &str, ctx: &Context<'_>, cfg: &TypeSafeConfig) -> Self {
         let mut seen = BTreeSet::new();
-
+        let mut apps = Vec::new();
         for e in ctx.index.shortlist(utterance, APP_CANDIDATES) {
             if seen.insert(e.name.to_lowercase()) {
-                let desc = match &e.generic_name {
-                    Some(g) => format!("installed application ({g})"),
-                    None => "installed application".to_string(),
-                };
-                targets.insert(e.name.clone(), desc);
+                apps.push((e.name.clone(), e.generic_name.clone()));
             }
         }
-        let mut open_windows = BTreeSet::new();
-        for w in ctx.windows {
-            open_windows.insert(w.title.clone());
-            if seen.insert(w.title.to_lowercase()) {
-                targets.insert(
-                    w.title.clone(),
-                    format!("window that is already open, belonging to {}", w.class),
-                );
-            }
-        }
-        targets.insert(
-            FOCUSED.into(),
-            "the window that currently has focus, because the user named no target".into(),
-        );
-        targets.insert(
-            NO_TARGET.into(),
-            "the utterance names no application or window".into(),
-        );
+
+        let mut seen_ids = BTreeSet::new();
+        let windows: Vec<Window> = ctx
+            .windows
+            .iter()
+            .filter(|w| seen_ids.insert(w.id.clone()))
+            .take(WINDOW_CANDIDATES)
+            .cloned()
+            .collect();
 
         // Every trailing span, so a payload can be selected verbatim instead
         // of regenerated. "tell claude to fix the test" -> "to fix the test".
         let words: Vec<&str> = utterance.split_whitespace().collect();
-        let spans: Vec<String> = (0..words.len()).map(|i| words[i..].join(" ")).collect();
+        let tail = &words[words.len().saturating_sub(PAYLOAD_SPANS)..];
+        let spans: Vec<String> = (0..tail.len()).map(|i| tail[i..].join(" ")).collect();
 
-        Self {
-            targets,
-            open_windows,
+        Self::assemble(
+            apps,
+            windows,
             spans,
-        }
+            ctx.current_desktop,
+            ctx.desktop_count,
+            cfg.send_window_titles,
+        )
     }
 
-    fn questions(&self, ctx: &Context<'_>) -> BTreeMap<String, Question> {
-        let mut q = BTreeMap::new();
+    fn assemble(
+        apps: Vec<(String, Option<String>)>,
+        windows: Vec<Window>,
+        spans: Vec<String>,
+        current_desktop: u32,
+        desktop_count: u32,
+        send_window_titles: bool,
+    ) -> Self {
+        let mut targets: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for (i, (name, generic)) in apps.iter().enumerate() {
+            let desc = match generic {
+                Some(g) => format!("installed application {name} ({g})"),
+                None => format!("installed application {name}"),
+            };
+            targets.insert(format!("{APP_KEY}{i}"), json!(desc));
+        }
+        let mut per_class: BTreeMap<String, usize> = BTreeMap::new();
+        for (i, w) in windows.iter().enumerate() {
+            let nth = per_class.entry(w.class.to_lowercase()).or_default();
+            *nth += 1;
+            let desc = if send_window_titles {
+                format!("open window of {}, titled {:?}", w.class, w.title)
+            } else {
+                format!("open window #{nth} of {}", w.class)
+            };
+            targets.insert(format!("{WINDOW_KEY}{i}"), json!(desc));
+        }
+        targets.insert(
+            FOCUSED.into(),
+            json!("the window that currently has focus, because the user named no target"),
+        );
+        targets.insert(
+            NO_TARGET.into(),
+            json!("the utterance names no application or window"),
+        );
 
+        let mut desktops: BTreeMap<String, serde_json::Value> = (1..=desktop_count
+            .min(DESKTOP_CANDIDATES))
+            .map(|n| (n.to_string(), json!(format!("virtual desktop number {n}"))))
+            .collect();
+        desktops.insert(
+            NO_TARGET.into(),
+            json!("no specific desktop number is named"),
+        );
+
+        let mut payload: BTreeMap<String, serde_json::Value> = spans
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("{SPAN_KEY}{i}"), json!(s)))
+            .collect();
+        payload.insert(
+            NO_TARGET.into(),
+            json!("`utterance` carries no such message"),
+        );
+
+        let mut q = BTreeMap::new();
         q.insert(
             "intent".into(),
             Question::Choice {
@@ -316,7 +455,6 @@ impl Candidates {
                 criteria: intent_criteria(),
             },
         );
-
         q.insert(
             "is_dictation".into(),
             Question::Noul {
@@ -327,7 +465,6 @@ impl Candidates {
                 }),
             },
         );
-
         q.insert(
             "is_destructive".into(),
             Question::Noul {
@@ -341,37 +478,23 @@ impl Candidates {
                 }),
             },
         );
-
         q.insert(
             "target".into(),
             Question::Choice {
                 instructions: json!({
                     "task": "Assuming `utterance` acts on an application or window, which candidate did the user mean?",
-                    "note": "Candidates are the applications installed on this machine and the windows currently open. Choose the open window when the user implies something already running.",
+                    "note": "Candidates are the applications installed on this machine and the windows currently open (the `w:` keys match `open_windows`). Choose the open window when the user implies something already running.",
                 }),
-                criteria: self
-                    .targets
-                    .iter()
-                    .map(|(k, v)| (k.clone(), json!(v)))
-                    .collect(),
+                criteria: targets,
             },
-        );
-
-        let mut desktops: BTreeMap<String, serde_json::Value> = (1..=ctx.desktop_count.max(1))
-            .map(|n| (n.to_string(), json!(format!("virtual desktop number {n}"))))
-            .collect();
-        desktops.insert(
-            NO_TARGET.into(),
-            json!("no specific desktop number is named"),
         );
         q.insert(
             "desktop_number".into(),
             Question::Choice {
-                instructions: json!("Assuming `utterance` asks to switch to a specific numbered virtual desktop, which number? The user is currently on `current_desktop`."),
+                instructions: json!(format!("Assuming `utterance` asks to switch to a specific numbered virtual desktop, which number? The user is currently on desktop {current_desktop}.")),
                 criteria: desktops,
             },
         );
-
         q.insert(
             "desktop_direction".into(),
             Question::Choice {
@@ -383,7 +506,6 @@ impl Candidates {
                 ]),
             },
         );
-
         q.insert(
             "claude_model".into(),
             Question::Choice {
@@ -396,29 +518,127 @@ impl Candidates {
                 ]),
             },
         );
-
-        let mut spans: BTreeMap<String, serde_json::Value> = self
-            .spans
-            .iter()
-            .map(|s| (s.clone(), json!(null)))
-            .collect();
-        spans.insert(
-            NO_TARGET.into(),
-            json!("`utterance` carries no such message"),
-        );
         q.insert(
             "payload".into(),
             Question::Choice {
                 instructions: json!({
                     "task": "Assuming `utterance` carries a message to pass on verbatim — a prompt for Claude Code, a notification body, a search string, or a key chord — which candidate is exactly that message?",
-                    "focus": "Candidates are the trailing spans of `utterance`. Pick the one that starts where the command wrapper ends, keeping the message itself complete and unaltered.",
+                    "focus": "Each candidate's description is a trailing span of `utterance`. Pick the one that starts where the command wrapper ends, keeping the message itself complete and unaltered.",
                     "example": "For 'tell claude to fix the failing test', the message is 'to fix the failing test', not the whole utterance.",
                 }),
-                criteria: spans,
+                criteria: payload,
             },
         );
 
-        q
+        debug_assert!(q
+            .values()
+            .filter_map(Question::options)
+            .all(|o| o.len() <= MAX_CHOICE_OPTIONS));
+
+        Self {
+            apps: apps.into_iter().map(|(name, _)| name).collect(),
+            windows,
+            spans,
+            desktop_count,
+            send_window_titles,
+            questions: q,
+        }
+    }
+
+    /// The observed state the questions refer to. Window titles are included
+    /// only when the config allows them off the machine.
+    fn state(&self, utterance: &str, ctx: &Context<'_>) -> serde_json::Value {
+        let open_windows: Vec<serde_json::Value> = self
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let mut v = json!({
+                    "key": format!("{WINDOW_KEY}{i}"),
+                    "application": w.class,
+                });
+                if self.send_window_titles {
+                    v["title"] = json!(w.title);
+                }
+                v
+            })
+            .collect();
+        json!({
+            "utterance": utterance,
+            "open_windows": open_windows,
+            "current_desktop": ctx.current_desktop,
+            "desktop_count": ctx.desktop_count,
+            "claude_code_session_running": ctx.claude_running,
+        })
+    }
+
+    /// Was `key` among the options we sent for choice question `id`?
+    fn offered(&self, id: &str, key: &str) -> bool {
+        self.questions
+            .get(id)
+            .and_then(Question::options)
+            .is_some_and(|o| o.contains_key(key))
+    }
+
+    /// Read one choice answer. A value we never offered is an error rather
+    /// than a guess: the model cannot invent an option.
+    fn pick<'a>(&self, resp: &'a Response, id: &str) -> Result<Pick<'a>, String> {
+        let Some((key, conf)) = resp.choice(id) else {
+            return Ok(Pick::Missing);
+        };
+        if !self.offered(id, key) {
+            return Err(format!("model chose {key:?} for {id}, which was never offered"));
+        }
+        Ok(if key == NO_TARGET {
+            Pick::NoMatch(conf)
+        } else {
+            Pick::Chosen(key, conf)
+        })
+    }
+
+    /// Read one chosen argument key, folding its confidence into the running
+    /// minimum. A no-match answer yields None but still folds in: a shaky
+    /// "nothing named" is as much a doubt as a shaky name.
+    fn arg<'a>(
+        &self,
+        resp: &'a Response,
+        id: &str,
+        confidence: &mut f64,
+    ) -> Result<Option<&'a str>, String> {
+        Ok(match self.pick(resp, id)? {
+            Pick::Chosen(key, c) => {
+                *confidence = confidence.min(c);
+                Some(key)
+            }
+            Pick::NoMatch(c) => {
+                *confidence = confidence.min(c);
+                None
+            }
+            Pick::Missing => None,
+        })
+    }
+
+    fn target(&self, key: Option<&str>) -> Target<'_> {
+        let Some(key) = key else {
+            return Target::Unnamed;
+        };
+        if key == FOCUSED {
+            return Target::Focused;
+        }
+        if let Some(app) = indexed(key, APP_KEY).and_then(|i| self.apps.get(i)) {
+            return Target::App(app);
+        }
+        if let Some(w) = indexed(key, WINDOW_KEY).and_then(|i| self.windows.get(i)) {
+            return Target::Window(w);
+        }
+        Target::Unnamed
+    }
+
+    fn span(&self, key: &str) -> Result<&str, String> {
+        indexed(key, SPAN_KEY)
+            .and_then(|i| self.spans.get(i))
+            .map(String::as_str)
+            .ok_or_else(|| format!("payload key {key:?} names no span"))
     }
 }
 
@@ -491,11 +711,11 @@ fn intent_criteria() -> BTreeMap<String, serde_json::Value> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests_support {
-    use super::Response;
+mod tests {
+    use super::*;
 
     /// Recorded answers, exactly as the API returns them.
-    pub fn answers(json: serde_json::Value) -> Response {
+    fn resp(json: serde_json::Value) -> Response {
         serde_json::from_value(serde_json::json!({
             "model": "jev-latest",
             "answers": json,
@@ -504,7 +724,7 @@ pub(crate) mod tests_support {
         .expect("recorded answer should deserialize")
     }
 
-    pub fn pick(c: &str, conf: f64) -> serde_json::Value {
+    fn choice(c: &str, conf: f64) -> serde_json::Value {
         serde_json::json!({
             "type": "choice",
             "choice": c,
@@ -513,49 +733,84 @@ pub(crate) mod tests_support {
         })
     }
 
-    pub fn yes_no(p: f64) -> serde_json::Value {
+    fn noul(p: f64) -> serde_json::Value {
         serde_json::json!({ "type": "noul", "noul": p })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::tests_support::{answers as resp, pick as choice, yes_no as noul};
-    use super::*;
-
-    fn cfg() -> TypeSafeConfig {
-        TypeSafeConfig::default()
+    fn window(id: &str, title: &str, class: &str) -> Window {
+        Window {
+            id: id.into(),
+            title: title.into(),
+            class: class.into(),
+        }
     }
 
-    /// Nothing open, so `show_app` resolves to a launch.
+    const KONSOLE: (&str, &str, &str) = ("{k1}", "build — Konsole", "konsole");
+
+    /// Apps keyed `a:<i>` in order, windows `w:<i>`, spans `p:<i>` from the
+    /// utterance's words. Titles are sent, as on an opted-in machine.
+    fn cand_with(apps: &[&str], windows: &[(&str, &str, &str)], desktops: u32, utterance: &str) -> Candidates {
+        let words: Vec<&str> = utterance.split_whitespace().collect();
+        Candidates::assemble(
+            apps.iter().map(|a| ((*a).to_string(), None)).collect(),
+            windows.iter().map(|(i, t, c)| window(i, t, c)).collect(),
+            (0..words.len()).map(|i| words[i..].join(" ")).collect(),
+            1,
+            desktops,
+            true,
+        )
+    }
+
     fn cand() -> Candidates {
-        Candidates::with_open_windows(&[])
+        cand_with(&["Firefox", "Kate"], &[KONSOLE], 2, "")
+    }
+
+    fn policy() -> Policy {
+        Policy::default()
+    }
+
+    /// The built intent plus what the default policy makes of it.
+    fn act(v: Verdict) -> (Resolved, Decision) {
+        match v {
+            Verdict::Act(r) => {
+                let d = policy().decide(&r.intent, &r.signals);
+                (r, d)
+            }
+            other => panic!("expected Act, got {other:?}"),
+        }
+    }
+
+    fn refused(v: Verdict) -> String {
+        match act(v) {
+            (_, Decision::Refuse { reason }) => reason,
+            (r, d) => panic!("expected Refuse, got {d:?} for {r:?}"),
+        }
+    }
+
+    fn unclear(v: Verdict) -> String {
+        match v {
+            Verdict::Unclear(s) => s,
+            other => panic!("expected Unclear, got {other:?}"),
+        }
     }
 
     #[test]
     fn confident_launch_acts_without_confirmation() {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.94),
-            "target": choice("Firefox", 0.99),
+            "target": choice("a:0", 0.99),
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.03),
         }));
-        match compose(&r, &cfg(), &cand()) {
-            Judgment::Act {
-                intent,
-                needs_confirmation,
-                ..
-            } => {
-                assert_eq!(
-                    intent,
-                    Intent::LaunchApp {
-                        query: "Firefox".into()
-                    }
-                );
-                assert!(!needs_confirmation);
+        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(
+            got.intent,
+            Intent::LaunchApp {
+                query: "Firefox".into()
             }
-            other => panic!("expected Act, got {other:?}"),
-        }
+        );
+        assert_eq!(decision, Decision::Act);
+        assert_eq!(got.window_id, None);
     }
 
     #[test]
@@ -564,14 +819,37 @@ mod tests {
         // argument; multiplying would have given 0.47 and read as unclear.
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.95),
-            "target": choice("Kate", 0.50),
+            "target": choice("a:1", 0.50),
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.01),
         }));
-        match compose(&r, &cfg(), &cand()) {
-            Judgment::Act { confidence, .. } => assert_eq!(confidence, 0.50),
-            other => panic!("expected Act, got {other:?}"),
-        }
+        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(got.confidence, 0.50);
+        assert!(matches!(decision, Decision::Confirm { .. }));
+    }
+
+    #[test]
+    fn no_match_confidence_is_folded_in() {
+        // A shaky "no model named" is a doubt about the whole action, so it
+        // must drag the confidence down instead of vanishing.
+        let r = resp(serde_json::json!({
+            "intent": choice("start_claude", 0.99),
+            "claude_model": choice(NO_TARGET, 0.50),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.02),
+        }));
+        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(got.intent, Intent::StartClaude { model: None });
+        assert_eq!(got.confidence, 0.50);
+        assert!(matches!(decision, Decision::Confirm { .. }));
+
+        let r = resp(serde_json::json!({
+            "intent": choice("start_claude", 0.99),
+            "claude_model": choice(NO_TARGET, 0.20),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.02),
+        }));
+        assert!(refused(compose(&r, &policy(), &cand())).contains("0.20"));
     }
 
     #[test]
@@ -579,11 +857,14 @@ mod tests {
         // Prose that happens to read like a command must not be executed.
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.99),
-            "target": choice("Firefox", 0.99),
+            "target": choice("a:0", 0.99),
             "is_dictation": noul(0.88),
             "is_destructive": noul(0.01),
         }));
-        assert!(matches!(compose(&r, &cfg(), &cand()), Judgment::Dictation));
+        assert!(matches!(
+            compose(&r, &policy(), &cand()),
+            Verdict::Dictation
+        ));
     }
 
     #[test]
@@ -592,39 +873,87 @@ mod tests {
         // out: closing a terminal mid-build still asks.
         let r = resp(serde_json::json!({
             "intent": choice("close_window", 1.0),
-            "target": choice("build — Konsole", 1.0),
+            "target": choice("w:0", 1.0),
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.91),
         }));
-        match compose(&r, &cfg(), &cand()) {
-            Judgment::Act {
-                needs_confirmation, ..
-            } => assert!(needs_confirmation),
-            other => panic!("expected Act, got {other:?}"),
-        }
+        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(
+            got.intent,
+            Intent::CloseWindow {
+                query: Some("build — Konsole".into())
+            }
+        );
+        assert_eq!(got.window_id.as_deref(), Some("{k1}"));
+        assert!(matches!(decision, Decision::Confirm { .. }));
     }
 
     #[test]
-    fn harmless_intent_judged_safe_skips_confirmation() {
+    fn missing_safety_answers_force_confirmation() {
+        // No is_destructive answer is not "safe": a harmless-looking
+        // minimize must still ask.
+        let r = resp(serde_json::json!({
+            "intent": choice("minimize_window", 0.95),
+            "target": choice(FOCUSED, 0.95),
+            "is_dictation": noul(0.01),
+        }));
+        let (_, decision) = act(compose(&r, &policy(), &cand()));
+        assert!(matches!(decision, Decision::Confirm { .. }));
+
+        // Likewise a missing (or wrong-typed) is_dictation answer.
+        let r = resp(serde_json::json!({
+            "intent": choice("minimize_window", 0.95),
+            "target": choice(FOCUSED, 0.95),
+            "is_dictation": choice("yes", 0.9),
+            "is_destructive": noul(0.01),
+        }));
+        let (_, decision) = act(compose(&r, &policy(), &cand()));
+        assert!(matches!(decision, Decision::Confirm { .. }));
+    }
+
+    #[test]
+    fn explicit_focused_window_judged_safe_skips_confirmation() {
         // The structural rule marks every close_window destructive; the
-        // judged one lets a scratch viewer through.
+        // judged one lets minimizing the focused window through.
         let r = resp(serde_json::json!({
             "intent": choice("minimize_window", 0.92),
-            "target": choice("__focused_window__", 0.95),
+            "target": choice(FOCUSED, 0.95),
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.04),
         }));
-        match compose(&r, &cfg(), &cand()) {
-            Judgment::Act {
-                intent,
-                needs_confirmation,
-                ..
-            } => {
-                assert_eq!(intent, Intent::MinimizeWindow { query: None });
-                assert!(!needs_confirmation);
-            }
-            other => panic!("expected Act, got {other:?}"),
-        }
+        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(got.intent, Intent::MinimizeWindow { query: None });
+        assert_eq!(decision, Decision::Act);
+    }
+
+    #[test]
+    fn minimize_with_no_target_is_unclear() {
+        // Neither "nothing named" nor silence means the focused window.
+        let none = resp(serde_json::json!({
+            "intent": choice("minimize_window", 0.92),
+            "target": choice(NO_TARGET, 0.95),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.04),
+        }));
+        assert!(unclear(compose(&none, &policy(), &cand())).contains("without a target"));
+
+        let missing = resp(serde_json::json!({
+            "intent": choice("close_window", 0.92),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.04),
+        }));
+        assert!(unclear(compose(&missing, &policy(), &cand())).contains("without a target"));
+    }
+
+    #[test]
+    fn show_app_on_the_focused_window_is_unclear() {
+        let r = resp(serde_json::json!({
+            "intent": choice("show_app", 0.9),
+            "target": choice(FOCUSED, 0.9),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.01),
+        }));
+        unclear(compose(&r, &policy(), &cand()));
     }
 
     #[test]
@@ -633,17 +962,19 @@ mod tests {
             "intent": choice(NO_TARGET, 0.9),
             "is_dictation": noul(0.1),
         }));
-        assert!(matches!(
-            compose(&none, &cfg(), &cand()),
-            Judgment::Unclear(_)
-        ));
+        unclear(compose(&none, &policy(), &cand()));
 
+        // Low confidence with an otherwise complete answer is the policy's
+        // refusal, and the flattened view turns that into Unclear.
         let shaky = resp(serde_json::json!({
             "intent": choice("close_window", 0.20),
+            "target": choice(FOCUSED, 0.9),
             "is_dictation": noul(0.1),
+            "is_destructive": noul(0.1),
         }));
+        refused(compose(&shaky, &policy(), &cand()));
         assert!(matches!(
-            compose(&shaky, &cfg(), &cand()),
+            compose(&shaky, &policy(), &cand()).flatten(&policy()),
             Judgment::Unclear(_)
         ));
     }
@@ -657,7 +988,68 @@ mod tests {
             "desktop_number": choice(NO_TARGET, 0.99),
             "is_dictation": noul(0.01),
         }));
-        assert!(matches!(compose(&r, &cfg(), &cand()), Judgment::Unclear(_)));
+        unclear(compose(&r, &policy(), &cand()));
+    }
+
+    #[test]
+    fn out_of_range_desktop_is_unclear() {
+        let r = resp(serde_json::json!({
+            "intent": choice("virtual_desktop", 0.97),
+            "desktop_number": choice("3", 0.99),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.01),
+        }));
+        // Two desktops were offered, so "3" was never a candidate.
+        assert!(unclear(compose(&r, &policy(), &cand())).contains("never offered"));
+
+        let r = resp(serde_json::json!({
+            "intent": choice("virtual_desktop", 0.97),
+            "desktop_number": choice("2", 0.99),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.01),
+        }));
+        let (got, _) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(got.intent, Intent::VirtualDesktop { n: 2 });
+    }
+
+    #[test]
+    fn unknown_direction_is_unclear_not_next() {
+        let r = resp(serde_json::json!({
+            "intent": choice("virtual_desktop_rel", 0.97),
+            "desktop_direction": choice("sideways", 0.99),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.01),
+        }));
+        unclear(compose(&r, &policy(), &cand()));
+
+        let r = resp(serde_json::json!({
+            "intent": choice("virtual_desktop_rel", 0.97),
+            "desktop_direction": choice("previous", 0.99),
+            "is_dictation": noul(0.01),
+            "is_destructive": noul(0.01),
+        }));
+        let (got, _) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(got.intent, Intent::VirtualDesktopRel { delta: -1 });
+    }
+
+    #[test]
+    fn unoffered_choice_is_rejected() {
+        // The model returning a bare app name instead of a key is a value we
+        // never sent; it must not resolve to anything.
+        let r = resp(serde_json::json!({
+            "intent": choice("show_app", 0.94),
+            "target": choice("Firefox", 0.99),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.03),
+        }));
+        assert!(unclear(compose(&r, &policy(), &cand())).contains("never offered"));
+
+        let r = resp(serde_json::json!({
+            "intent": choice("reboot", 0.94),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.03),
+        }));
+        assert!(unclear(compose(&r, &policy(), &cand())).contains("never offered"));
     }
 
     #[test]
@@ -668,80 +1060,173 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.02),
         }));
-        match compose(&r, &cfg(), &cand()) {
-            Judgment::Act { intent, .. } => {
-                assert_eq!(intent, Intent::StartClaude { model: None });
-            }
-            other => panic!("expected Act, got {other:?}"),
-        }
+        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        assert_eq!(got.intent, Intent::StartClaude { model: None });
+        assert_eq!(decision, Decision::Act);
     }
 
     #[test]
-    fn payload_span_is_taken_verbatim() {
+    fn payload_span_is_taken_verbatim_and_claude_tell_confirms() {
+        let c = cand_with(&[], &[], 1, "tell claude to rerun the failing test");
         let r = resp(serde_json::json!({
             "intent": choice("claude_tell", 0.93),
-            "payload": choice("to rerun the failing test", 0.9),
+            "payload": choice("p:2", 0.9),
             "is_dictation": noul(0.2),
             "is_destructive": noul(0.05),
         }));
-        match compose(&r, &cfg(), &cand()) {
-            Judgment::Act { intent, .. } => assert_eq!(
-                intent,
-                Intent::ClaudeTell {
-                    text: "to rerun the failing test".into()
-                }
-            ),
-            other => panic!("expected Act, got {other:?}"),
-        }
+        let (got, decision) = act(compose(&r, &policy(), &c));
+        assert_eq!(
+            got.intent,
+            Intent::ClaudeTell {
+                text: "to rerun the failing test".into()
+            }
+        );
+        assert!(matches!(decision, Decision::Confirm { .. }));
     }
-}
 
-#[cfg(test)]
-mod show_app_tests {
-    use super::tests_support::*;
-    use super::*;
+    #[test]
+    fn krunner_searches_for_the_payload() {
+        let c = cand_with(&["Firefox"], &[], 1, "search for quarterly report");
+        let r = resp(serde_json::json!({
+            "intent": choice("krunner", 0.93),
+            "target": choice("a:0", 0.9),
+            "payload": choice("p:2", 0.9),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.01),
+        }));
+        let (got, _) = act(compose(&r, &policy(), &c));
+        assert_eq!(
+            got.intent,
+            Intent::KRunner {
+                query: "quarterly report".into()
+            }
+        );
+    }
+
+    #[test]
+    fn sentinel_titled_window_is_not_no_match() {
+        let c = cand_with(&[], &[("{w9}", NO_TARGET, "kate"), ("{w10}", FOCUSED, "kate")], 1, "");
+        let r = resp(serde_json::json!({
+            "intent": choice("show_app", 0.9),
+            "target": choice("w:0", 0.95),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.02),
+        }));
+        let (got, _) = act(compose(&r, &policy(), &c));
+        assert_eq!(
+            got.intent,
+            Intent::FocusWindow {
+                query: NO_TARGET.into()
+            }
+        );
+        assert_eq!(got.window_id.as_deref(), Some("{w9}"));
+
+        let r = resp(serde_json::json!({
+            "intent": choice("minimize_window", 0.9),
+            "target": choice("w:1", 0.95),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.02),
+        }));
+        let (got, _) = act(compose(&r, &policy(), &c));
+        assert_eq!(
+            got.intent,
+            Intent::MinimizeWindow {
+                query: Some(FOCUSED.into())
+            }
+        );
+        assert_eq!(got.window_id.as_deref(), Some("{w10}"));
+    }
 
     #[test]
     fn show_app_becomes_launch_when_nothing_is_open() {
-        let r = answers(serde_json::json!({
-            "intent": pick("show_app", 0.9),
-            "target": pick("Dolphin", 0.95),
-            "is_dictation": yes_no(0.02),
-            "is_destructive": yes_no(0.02),
+        let c = cand_with(&["Dolphin"], &[KONSOLE], 1, "");
+        let r = resp(serde_json::json!({
+            "intent": choice("show_app", 0.9),
+            "target": choice("a:0", 0.95),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.02),
         }));
-        let cand = Candidates::with_open_windows(&["build — Konsole"]);
-        match compose(&r, &TypeSafeConfig::default(), &cand) {
-            Judgment::Act { intent, .. } => {
-                assert_eq!(
-                    intent,
-                    Intent::LaunchApp {
-                        query: "Dolphin".into()
-                    }
-                )
+        let (got, _) = act(compose(&r, &policy(), &c));
+        assert_eq!(
+            got.intent,
+            Intent::LaunchApp {
+                query: "Dolphin".into()
             }
-            other => panic!("expected Act, got {other:?}"),
-        }
+        );
     }
 
     #[test]
     fn show_app_becomes_focus_when_the_window_exists() {
-        // Same answers, different observed state: code flips the verb, and no
+        // Same wish, different observed state: code flips the verb, and no
         // model probability was spent on the distinction.
-        let r = answers(serde_json::json!({
-            "intent": pick("show_app", 0.9),
-            "target": pick("build — Konsole", 0.95),
-            "is_dictation": yes_no(0.02),
-            "is_destructive": yes_no(0.02),
+        let c = cand_with(&["Dolphin"], &[KONSOLE], 1, "");
+        let r = resp(serde_json::json!({
+            "intent": choice("show_app", 0.9),
+            "target": choice("w:0", 0.95),
+            "is_dictation": noul(0.02),
+            "is_destructive": noul(0.02),
         }));
-        let cand = Candidates::with_open_windows(&["build — Konsole"]);
-        match compose(&r, &TypeSafeConfig::default(), &cand) {
-            Judgment::Act { intent, .. } => assert_eq!(
-                intent,
-                Intent::FocusWindow {
-                    query: "build — Konsole".into()
-                }
-            ),
-            other => panic!("expected Act, got {other:?}"),
+        let (got, _) = act(compose(&r, &policy(), &c));
+        assert_eq!(
+            got.intent,
+            Intent::FocusWindow {
+                query: "build — Konsole".into()
+            }
+        );
+        assert_eq!(got.window_id.as_deref(), Some("{k1}"));
+    }
+
+    #[test]
+    fn window_titles_stay_home_unless_opted_in() {
+        let index = DesktopIndex::from_dirs(&[]);
+        let windows = vec![window("{w1}", "secret-plan.md — Kate", "kate")];
+        let ctx = Context {
+            windows: &windows,
+            index: &index,
+            current_desktop: 1,
+            desktop_count: 1,
+            claude_running: false,
+        };
+        let sent = |send_window_titles: bool| {
+            let cfg = TypeSafeConfig {
+                send_window_titles,
+                ..TypeSafeConfig::default()
+            };
+            let c = Candidates::build("bring up kate", &ctx, &cfg);
+            let state = serde_json::to_string(&c.state("bring up kate", &ctx)).unwrap();
+            let questions = serde_json::to_string(&c.questions).unwrap();
+            state + &questions
+        };
+        let private = sent(false);
+        assert!(!private.contains("secret-plan"), "{private}");
+        assert!(private.contains("kate"));
+        assert!(sent(true).contains("secret-plan.md"));
+    }
+
+    #[test]
+    fn windows_dedupe_by_id_and_questions_stay_within_the_option_limit() {
+        let index = DesktopIndex::from_dirs(&[]);
+        let mut windows: Vec<Window> = (0..300)
+            .map(|i| window(&format!("{{w{i}}}"), "Same title", "kate"))
+            .collect();
+        windows.push(window("{w0}", "Same title", "kate"));
+        let ctx = Context {
+            windows: &windows,
+            index: &index,
+            current_desktop: 1,
+            desktop_count: 400,
+            claude_running: false,
+        };
+        let utterance = vec!["word"; 300].join(" ");
+        let c = Candidates::build(&utterance, &ctx, &TypeSafeConfig::default());
+        assert_eq!(c.windows.len(), WINDOW_CANDIDATES);
+        assert_eq!(c.spans.len(), PAYLOAD_SPANS);
+        for (id, q) in &c.questions {
+            if let Some(o) = q.options() {
+                assert!(o.len() <= MAX_CHOICE_OPTIONS, "{id} offers {}", o.len());
+            }
         }
+        let n = c.questions["desktop_number"].options().unwrap().len();
+        assert_eq!(n, MAX_CHOICE_OPTIONS);
     }
 }

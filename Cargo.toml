@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/parlad", "crates/desktopd", "crates/grammar", "crates/flow"]
+members = ["crates/parlad", "crates/desktopd", "crates/grammar", "crates/flow", "crates/ui"]
+# `cargo build` skips the UI, which needs Qt 6 and Kirigami; build it with
+# `--workspace` or `-p parla-ui`.
+default-members = ["crates/parlad", "crates/desktopd", "crates/grammar", "crates/flow"]
 
 [workspace.package]
 version = "0.1.0"

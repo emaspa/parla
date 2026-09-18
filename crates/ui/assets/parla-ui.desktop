@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=parla
+GenericName=Voice dictation
+Comment=Push-to-talk dictation and voice commands for the desktop
+Exec=parla-ui
+Icon=audio-input-microphone
+Terminal=false
+Categories=Utility;Audio;
+Keywords=dictation;voice;speech;whisper;
+StartupNotify=false

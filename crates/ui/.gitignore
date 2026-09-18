@@ -1,0 +1,2 @@
+# Written by cxx-qt-build on every build; it holds absolute paths for qmlls.
+.qmlls.ini

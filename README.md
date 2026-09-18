@@ -127,8 +127,8 @@ another machine.
 
 ## The UI
 
-`parla-ui`, a Qt Quick and Kirigami application, is being built in a
-separate crate and lands next. It talks to the daemon over the session bus, name
+`parla-ui` is a Qt Quick and Kirigami application, so it looks like the
+rest of Plasma. It talks to the daemon over the session bus, name
 `org.parla.Daemon`, interface `org.parla.Daemon1`. The contract is in
 `crates/parlad/dbus/org.parla.Daemon1.xml`.
 
@@ -149,6 +149,19 @@ utterance with the raw transcript, what was typed or done, the window
 class, and timings. `flow.history = false` turns it off.
 
 The daemon runs without the UI, and without a session bus at all.
+
+The UI is Rust too, through cxx-qt, with a short C++ shim for the
+application object and the tray. `parla-mockd` is a stand-in daemon that
+serves the same interface with made-up state and history, so the UI can be
+worked on without a microphone:
+
+```
+cargo build --release -p parla-ui
+./target/release/parla-mockd &
+./target/release/parla-ui
+```
+
+It refuses to start while a real parlad owns the bus name.
 
 ## The judged path
 
@@ -270,9 +283,11 @@ probe fails. Launching tries `kioclient`, then `gtk-launch`, then
 
 ```
 cargo build --release
+cargo build --release -p parla-ui
 ```
 
-Put the models where the config expects them:
+The first builds the daemon and its libraries; the UI is a separate step
+because it needs Qt. Put the models where the config expects them:
 
 ```
 scripts/fetch-model.sh
@@ -313,6 +328,7 @@ up.
 | `desktopd` | The executor and its `Command` vocabulary: windows, launching, the `.desktop` index, virtual desktops, tmux, text injection |
 | `parla-flow` | Dictionary, snippets, app profiles and history: the files both the daemon and the UI read |
 | `parlad` | The daemon: capture, VAD, ASR, hotkeys, router, policy, confirmation, dictation cleanup, judged path, session bus |
+| `parla-ui` | The Kirigami UI: overlay, tray icon, history, dictionary, snippets, app profiles |
 
 `desktopd` is one implementation with two callers. It executes its own
 `Command` type, whose window targets are a query, a window id or the focused

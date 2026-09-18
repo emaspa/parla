@@ -37,6 +37,16 @@ Item {
         () => win.navigate("dictionary"),
         () => { page().addWord("Selftest"); page().addReplacement("self test", "selftest"); },
         () => { page().removeWord(0); },
+        () => {
+            const p = page();
+            console.info("selftest: suggestions", p.suggestions.length);
+            if (p.suggestions.length > 0) p.acceptSuggestion(p.suggestions[0].key);
+        },
+        () => {
+            const p = page();
+            if (p.suggestions.length > 0) p.dismissSuggestion(p.suggestions[0].key);
+            console.info("selftest: suggestions after accept and dismiss", p.suggestions.length, "words", p.words.length, "replacements", p.replacements.length, Store.lastError);
+        },
         () => win.navigate("snippets"),
         () => { page().add(); page().update(page().snippets.length - 1, "self test snippet", "hello from selftest"); },
         () => win.navigate("apps"),

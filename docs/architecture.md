@@ -78,6 +78,10 @@ kglobalaccel ── pressed ──▶ capture thread (cpal) ──▶ samples
    to the history file. The bus state walks through `recording`,
    `transcribing`, `thinking`, `typing` and back to `idle`, or to `waiting`
    when a prompt is up.
+7. **Learning.** When the field was readable, parlad reads the dictated
+   region back `flow.learn_after_ms` later, or when the next dictation
+   starts, and records a word replaced by another spelling of itself in
+   `learned.toml`; see [dictation.md](dictation.md).
 
 Only one capture runs at a time, but processing is a separate worker: a
 press while the last utterance is still being transcribed starts a new

@@ -40,6 +40,7 @@ by restarting; see [dictation.md](dictation.md).
 | `~/.config/parla/apps.toml` | Per-application cleanup profiles. Written on first save; until then the built-in defaults apply. |
 | `~/.local/share/parla/models/` | The whisper, Silero VAD and GGUF models, where `scripts/fetch-model.sh` puts them. |
 | `~/.local/share/parla/history.jsonl` | One JSON record per utterance, when `flow.history` is on. |
+| `~/.local/share/parla/learned.toml` | Corrections noticed after dictations, with the pairs that were dismissed. Written by the daemon and the UI. |
 | `~/.local/state/parla/parlad.lock` | Held with `flock` while a daemon runs. |
 | `~/.config/autostart/parla-ui.desktop` | Written by the UI's "Start with the session" switch. |
 
@@ -259,6 +260,8 @@ max_tokens = 1024
 history = true
 edit_window_ms = 90000
 context = true
+learn = "suggest"
+learn_after_ms = 20000
 
 [flow.openai]
 base_url = "https://api.openai.com/v1"
@@ -296,6 +299,15 @@ capitalisation, and gets a leading space when it needs one. It needs
 `desktopd.a11y`. Nothing is read from a password field, and profiles with
 the code tone get the leading-space rule only. With the OpenAI backend the
 text before the cursor is sent with the transcript. The details are in
+[dictation.md](dictation.md).
+
+`learn` is what happens when a word is changed by hand right after a
+dictation. `suggest` records the pair in `learned.toml` and the UI's
+Dictionary page offers it. `auto` also moves a pair seen twice into the
+dictionary and reloads it. `off` never reads the field back. It needs
+`desktopd.a11y`, and does not need `context`. `learn_after_ms` is how
+long after typing the field is read again; the next dictation triggers
+the read earlier. The rules for what counts as a correction are in
 [dictation.md](dictation.md).
 
 ## `[desktopd]`

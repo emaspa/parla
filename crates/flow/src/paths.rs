@@ -14,7 +14,7 @@ pub fn config_dir() -> PathBuf {
         .join("parla")
 }
 
-/// `$XDG_DATA_HOME/parla`: models and history.
+/// `$XDG_DATA_HOME/parla`: models, history and learned spellings.
 pub fn data_dir() -> PathBuf {
     std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -36,6 +36,11 @@ pub fn apps() -> PathBuf {
 
 pub fn history() -> PathBuf {
     data_dir().join("history.jsonl")
+}
+
+/// Corrections noticed after dictations, waiting to be accepted.
+pub fn learned() -> PathBuf {
+    data_dir().join("learned.toml")
 }
 
 /// Write `contents` to `path` through a temporary file in the same

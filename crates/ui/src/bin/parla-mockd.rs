@@ -281,6 +281,7 @@ impl Mock {
             "snippets": paths::snippets(),
             "apps": paths::apps(),
             "history": paths::history(),
+            "learned": paths::learned(),
         })
         .to_string()
     }

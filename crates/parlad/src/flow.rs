@@ -15,14 +15,19 @@
 //!
 //! The same model applies a spoken instruction to the text just dictated
 //! ("make that more formal"); see [`Flow::edit`].
+//!
+//! A word the user changes in the field right after a dictation is a
+//! correction parla can learn from; [`Flow::learn`] records those pairs
+//! and, when the config says so, moves them into the dictionary.
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use parla_flow::learned::{self, Suggestions};
 use parla_flow::{paths, AppProfile, AppProfiles, Dictionary, History, Record, Snippets};
 
-use crate::config::{FlowBackend, FlowConfig};
+use crate::config::{FlowBackend, FlowConfig, LearnMode};
 use crate::local::{Generated, LocalModel};
 use crate::openai;
 
@@ -139,6 +144,8 @@ pub struct Flow {
     edit_window: Duration,
     /// Tell the model what is before the cursor, when it can be read.
     context: bool,
+    learn: LearnMode,
+    learn_after: Duration,
     store: RwLock<Store>,
     history: Option<Mutex<History>>,
     /// `asr.initial_prompt` from the config; the dictionary's words follow it.
@@ -153,6 +160,17 @@ pub struct Processed {
     pub outcome: &'static str,
     /// Name of the profile that applied, empty for a snippet.
     pub profile: String,
+}
+
+/// One correction [`Flow::learn`] took note of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Learned {
+    pub heard: String,
+    pub written: String,
+    /// Times seen so far, this one included.
+    pub count: u32,
+    /// Moved into the dictionary (`flow.learn = "auto"`).
+    pub promoted: bool,
 }
 
 impl Flow {
@@ -195,6 +213,8 @@ impl Flow {
             max_tokens: cfg.max_tokens,
             edit_window: Duration::from_millis(cfg.edit_window_ms),
             context: cfg.context,
+            learn: cfg.learn,
+            learn_after: Duration::from_millis(cfg.learn_after_ms),
             store: RwLock::new(store),
             history: cfg
                 .history
@@ -231,6 +251,66 @@ impl Flow {
     /// Whether the text around the cursor is read and given to the model.
     pub fn context_enabled(&self) -> bool {
         self.context
+    }
+
+    /// Whether corrections are looked for after a dictation.
+    pub fn learn_enabled(&self) -> bool {
+        self.learn != LearnMode::Off
+    }
+
+    /// How long after a dictation the field is read again.
+    pub fn learn_after(&self) -> Duration {
+        self.learn_after
+    }
+
+    /// Take note of corrections seen after a dictation into `app`. A pair
+    /// the dictionary already covers, or the user dismissed, is skipped.
+    /// With `flow.learn = "auto"` a pair seen twice goes into the
+    /// dictionary (its written form as a word, the pair as a replacement)
+    /// and the files are reloaded. Returns what was recorded.
+    pub fn learn(&self, pairs: &[(String, String)], app: &str) -> anyhow::Result<Vec<Learned>> {
+        if pairs.is_empty() || self.learn == LearnMode::Off {
+            return Ok(Vec::new());
+        }
+        let path = paths::learned();
+        let mut suggestions = Suggestions::load(&path)?;
+        let mut dictionary = Dictionary::load(&paths::dictionary())?;
+        let mut out = Vec::new();
+        let mut promoted = false;
+        for (heard, written) in pairs {
+            if learned::covered(&dictionary, heard, written)
+                || suggestions.is_dismissed(heard, written)
+            {
+                continue;
+            }
+            let count = suggestions.record(heard, written, app);
+            if count == 0 {
+                continue;
+            }
+            let mut l = Learned {
+                heard: heard.clone(),
+                written: written.clone(),
+                count,
+                promoted: false,
+            };
+            if self.learn == LearnMode::Auto && count >= 2 {
+                if let Some(r) = suggestions.accept(&learned::key(heard, written)) {
+                    learned::add_to_dictionary(&mut dictionary, r);
+                    l.promoted = true;
+                    promoted = true;
+                }
+            }
+            out.push(l);
+        }
+        if out.is_empty() {
+            return Ok(out);
+        }
+        suggestions.save(&path)?;
+        if promoted {
+            dictionary.save(&paths::dictionary())?;
+            self.reload()?;
+        }
+        Ok(out)
     }
 
     /// What whisper is primed with: the configured prompt, then the
@@ -406,6 +486,7 @@ impl Flow {
             "snippets": paths::snippets(),
             "apps": paths::apps(),
             "history": paths::history(),
+            "learned": paths::learned(),
         })
     }
 }

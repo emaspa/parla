@@ -1,12 +1,15 @@
 //! The `Store` QML singleton: the three editable TOML files (dictionary,
 //! snippets, app profiles) as JSON for QML, saved through the parla-flow
-//! types so the daemon and a text editor see the same format. Also the
-//! desktop bits that are not the daemon's business: autostart and paths.
+//! types so the daemon and a text editor see the same format, plus the
+//! spellings the daemon learned from corrections, which the Dictionary
+//! page offers. Also the desktop bits that are not the daemon's business:
+//! autostart and paths.
 
 use std::path::PathBuf;
 
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::QString;
+use parla_flow::learned::{self, Suggestions};
 use parla_flow::{paths, AppProfiles, Dictionary, Snippets};
 
 #[cxx_qt::bridge]
@@ -28,6 +31,7 @@ pub mod qobject {
         #[qproperty(QString, snippets_file)]
         #[qproperty(QString, apps_file)]
         #[qproperty(QString, history_file)]
+        #[qproperty(QString, learned_file)]
         #[qproperty(QString, autostart_file)]
         /// The last load/save failure, "" after a success.
         #[qproperty(QString, last_error)]
@@ -49,6 +53,18 @@ pub mod qobject {
         fn load_apps(self: Pin<&mut Store>) -> QString;
         #[qinvokable]
         fn save_apps(self: Pin<&mut Store>, json: &QString) -> bool;
+        /// JSON `[{key, heard, written, count, last_at_ms, app}]` of the
+        /// corrections the daemon noticed, newest first.
+        #[qinvokable]
+        fn load_suggestions(self: Pin<&mut Store>) -> QString;
+        /// Move a suggestion into the dictionary: its written form to the
+        /// words, the pair to the replacements. Saves both files; the
+        /// caller asks the daemon to reload.
+        #[qinvokable]
+        fn accept_suggestion(self: Pin<&mut Store>, key: &QString) -> bool;
+        /// Drop a suggestion and keep it from coming back.
+        #[qinvokable]
+        fn dismiss_suggestion(self: Pin<&mut Store>, key: &QString) -> bool;
         /// Open a file with the desktop's default application (xdg-open).
         #[qinvokable]
         fn open_in_editor(self: Pin<&mut Store>, path: &QString) -> bool;
@@ -67,6 +83,7 @@ pub struct StoreRust {
     snippets_file: QString,
     apps_file: QString,
     history_file: QString,
+    learned_file: QString,
     autostart_file: QString,
     last_error: QString,
     autostart: bool,
@@ -100,6 +117,7 @@ impl cxx_qt::Initialize for qobject::Store {
         self.as_mut().set_snippets_file(q(paths::snippets()));
         self.as_mut().set_apps_file(q(paths::apps()));
         self.as_mut().set_history_file(q(paths::history()));
+        self.as_mut().set_learned_file(q(paths::learned()));
         self.as_mut().set_autostart_file(q(autostart_path()));
         let on = autostart_path().exists();
         self.as_mut().rust_mut().autostart = on;
@@ -164,6 +182,52 @@ impl qobject::Store {
         let r = serde_json::from_str::<AppProfiles>(&json.to_string())
             .map_err(anyhow::Error::from)
             .and_then(|a| a.save(&paths::apps()));
+        self.report_ok(r)
+    }
+
+    pub fn load_suggestions(self: core::pin::Pin<&mut Self>) -> QString {
+        let r = Suggestions::load(&paths::learned()).and_then(|s| {
+            let mut list = s.suggestions;
+            list.sort_by_key(|s| std::cmp::Reverse(s.last_at_ms));
+            let rows: Vec<serde_json::Value> = list
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "key": s.key(),
+                        "heard": s.heard,
+                        "written": s.written,
+                        "count": s.count,
+                        "last_at_ms": s.last_at_ms,
+                        "app": s.app,
+                    })
+                })
+                .collect();
+            Ok(serde_json::to_string(&rows)?)
+        });
+        self.report(r)
+    }
+
+    pub fn accept_suggestion(self: core::pin::Pin<&mut Self>, key: &QString) -> bool {
+        let key = key.to_string();
+        let r = (|| -> anyhow::Result<()> {
+            let mut suggestions = Suggestions::load(&paths::learned())?;
+            let replacement = suggestions
+                .accept(&key)
+                .ok_or_else(|| anyhow::anyhow!("no suggestion {key:?}"))?;
+            let mut dictionary = Dictionary::load(&paths::dictionary())?;
+            learned::add_to_dictionary(&mut dictionary, replacement);
+            dictionary.save(&paths::dictionary())?;
+            suggestions.save(&paths::learned())
+        })();
+        self.report_ok(r)
+    }
+
+    pub fn dismiss_suggestion(self: core::pin::Pin<&mut Self>, key: &QString) -> bool {
+        let key = key.to_string();
+        let r = Suggestions::load(&paths::learned()).and_then(|mut s| {
+            s.dismiss(&key);
+            s.save(&paths::learned())
+        });
         self.report_ok(r)
     }
 

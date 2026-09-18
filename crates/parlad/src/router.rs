@@ -6,13 +6,19 @@
 //! utterance.
 //!
 //! The router also remembers the last dictation for a while, so "scratch
-//! that" can take it back and "make that more formal" can rewrite it.
+//! that" can take it back and "make that more formal" can rewrite it, and,
+//! when the field could be read, reads it again a little later to see
+//! whether the user corrected a word by hand; see [`Learn`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use desktopd::{Command, DesktopIndex, Executor, FocusedText, Verified, Window, WindowTarget};
+use desktopd::{
+    Command, DesktopIndex, Executor, FocusedText, TextHandle, Verified, Window, WindowTarget,
+};
+use parla_flow::learned::corrections;
 use parla_grammar::{Grammar, Intent};
 
 use crate::command::{from_intent, from_resolved};
@@ -73,7 +79,34 @@ struct LastDictation {
     window_id: String,
     class: String,
     at: Instant,
+    /// Distinguishes this dictation from the ones before and after it, so
+    /// a timer set for it cannot act on another.
+    seq: u64,
+    /// A correction pass still to run, when the field could be read.
+    learn: Option<Learn>,
 }
+
+/// Characters of context kept on either side of a dictation, so the
+/// comparison has anchors that were not dictated.
+const LEARN_CONTEXT: usize = 20;
+/// Extra characters read past the region, so a word the user added at the
+/// end does not shift the context out of the read.
+const LEARN_SLACK: i32 = 40;
+
+/// What a correction pass needs: the field, and the region the dictation
+/// occupies in it, as it was right after typing.
+#[derive(Debug, Clone)]
+struct Learn {
+    handle: TextHandle,
+    app: String,
+    /// Context, the dictation, context.
+    expected: String,
+    /// Character offsets of `expected` in the field.
+    from: i32,
+    to: i32,
+}
+
+type Last = Arc<Mutex<Option<LastDictation>>>;
 
 pub struct Router {
     executor: Arc<Executor>,
@@ -82,7 +115,8 @@ pub struct Router {
     flow: Arc<Flow>,
     policy: Policy,
     pending: Confirmations,
-    last: Mutex<Option<LastDictation>>,
+    last: Last,
+    seq: AtomicU64,
     /// How long a confirmation prompt stays answerable.
     confirm_window: Duration,
     bus: Option<Bus>,
@@ -110,7 +144,8 @@ impl Router {
             flow,
             policy,
             pending: Confirmations::default(),
-            last: Mutex::new(None),
+            last: Arc::new(Mutex::new(None)),
+            seq: AtomicU64::new(0),
             confirm_window,
             bus,
         }
@@ -158,6 +193,17 @@ impl Router {
         field: Option<&FocusedText>,
     ) -> anyhow::Result<Handled> {
         let class = focused.map(|w| w.class.as_str()).unwrap_or_default();
+        // A correction pass still waiting for the previous dictation runs
+        // now, before this one changes the field.
+        let pending = self
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+            .and_then(|l| l.learn.take());
+        if let Some(learn) = pending {
+            learn_from(&self.flow, learn).await;
+        }
         let context = field
             .filter(|_| self.flow.context_enabled())
             .and_then(TextContext::from_focused);
@@ -173,12 +219,41 @@ impl Router {
         let processed = self.flow.process(transcript, class, context.as_ref()).await;
         self.progress(State::Typing, Mode::Dictate);
         self.executor.type_text(&processed.text).await?;
+        let learn = match field {
+            Some(f) if self.flow.learn_enabled() && !f.password => {
+                Some(learn_region(f, &processed.text).await)
+            }
+            _ => None,
+        };
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let armed = learn.is_some();
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastDictation {
             text: processed.text.clone(),
             window_id: focused.map(|w| w.id.clone()).unwrap_or_default(),
             class: class.to_string(),
             at: Instant::now(),
+            seq,
+            learn,
         });
+        if armed {
+            let last = Arc::clone(&self.last);
+            let flow = Arc::clone(&self.flow);
+            let after = self.flow.learn_after();
+            tokio::spawn(async move {
+                tokio::time::sleep(after).await;
+                // Gone if the dictation was scratched, edited or followed
+                // by another one, which ran the pass itself.
+                let learn = last
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_mut()
+                    .filter(|l| l.seq == seq)
+                    .and_then(|l| l.learn.take());
+                if let Some(learn) = learn {
+                    learn_from(&flow, learn).await;
+                }
+            });
+        }
         Ok(Handled::Typed(processed))
     }
 
@@ -353,6 +428,8 @@ impl Router {
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastDictation {
             text: text.clone(),
             at: Instant::now(),
+            // Rewritten by parla, not corrected by hand: nothing to learn.
+            learn: None,
             ..last
         });
         Ok(Handled::Typed(Processed {
@@ -433,6 +510,75 @@ impl Router {
         tracing::info!("confirmed: {} ({})", pending.describe, pending.reason);
         self.progress(State::Typing, Mode::Command);
         self.executor.execute(command).await.map(Handled::Done)
+    }
+}
+
+/// Where the dictation sits in the field once typed, with up to
+/// [`LEARN_CONTEXT`] characters of what was already there on either side.
+/// The caret after typing is read back when the application has processed
+/// the keystrokes by then, and computed from the text otherwise.
+async fn learn_region(field: &FocusedText, typed: &str) -> Learn {
+    let before: Vec<char> = field.before.chars().collect();
+    let k = before.len().min(LEARN_CONTEXT);
+    let before_tail: String = before[before.len() - k..].iter().collect();
+    let after_head: String = field.after.chars().take(LEARN_CONTEXT).collect();
+    let m = after_head.chars().count();
+    let computed = field.caret + typed.chars().count() as i32;
+    let caret_after = match field.handle.caret().await {
+        Ok(c) if c >= computed => c,
+        _ => computed,
+    };
+    Learn {
+        handle: field.handle.clone(),
+        app: field.app.clone(),
+        expected: format!("{before_tail}{typed}{after_head}"),
+        from: field.caret - k as i32,
+        to: caret_after + m as i32,
+    }
+}
+
+/// Read the region again, compare, and hand what changed to the flow. A
+/// field that can no longer be read is logged and forgotten.
+async fn learn_from(flow: &Flow, learn: Learn) {
+    let now = match learn.handle.read(learn.from, learn.to + LEARN_SLACK).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("learn: cannot read the field back in {}: {e:#}", learn.app);
+            return;
+        }
+    };
+    let pairs = corrections(&learn.expected, &now);
+    if pairs.is_empty() {
+        tracing::debug!("learn: no corrections in {}", learn.app);
+        return;
+    }
+    let learned = match flow.learn(&pairs, &learn.app) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("learn: {e:#}");
+            return;
+        }
+    };
+    for l in &learned {
+        tracing::info!(
+            "learned {:?} -> {:?} in {} (seen {} times{})",
+            l.heard,
+            l.written,
+            learn.app,
+            l.count,
+            if l.promoted { ", added to the dictionary" } else { "" }
+        );
+    }
+    let promoted: Vec<String> = learned
+        .iter()
+        .filter(|l| l.promoted)
+        .map(|l| format!("{} -> {}", l.heard, l.written))
+        .collect();
+    if !promoted.is_empty() {
+        let body = format!("Learned: {}", promoted.join(", "));
+        if let Err(e) = desktopd::notify::notify("parla", &body).await {
+            tracing::debug!("notification failed: {e}");
+        }
     }
 }
 

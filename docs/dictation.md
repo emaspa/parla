@@ -4,8 +4,9 @@ Hold the dictation hotkey (`ctrl+space` by default), speak, release. What
 whisper heard goes through snippets, the dictionary and cleanup, in that
 order, and lands in the focused window as keystrokes. When the focused text
 field can be read over the accessibility bus, the model also sees what is
-before the cursor. This page is the whole path from transcript to text, and
-the two ways of taking it back.
+before the cursor, and a word you fix by hand afterwards is noticed. This
+page is the whole path from transcript to text, the two ways of taking it
+back, and what parla learns from corrections.
 
 ## The order of things
 
@@ -284,6 +285,68 @@ PARLA_LAST_DICTATION=1 parlad --judge "make that more formal"
 The first runs an edit and prints the result. The second shows what the
 judge would do with the phrase when a dictation is fresh; without the
 variable the same phrase is judged unclear, since no text exists to edit.
+
+## Learning from corrections
+
+A name whisper spells wrong gets fixed by hand, and the fix is the
+dictionary entry that would have prevented it. When the focused field
+could be read at capture start, parlad reads it again after the
+dictation and compares.
+
+What is compared is the region the dictation occupies: up to 20
+characters of what was already before the cursor, the text parla typed,
+and up to 20 characters of what followed. The context is there to anchor
+the comparison. `flow.learn_after_ms` after typing (20 seconds by
+default), or when the next dictation starts if that comes first, parlad
+reads the same character range back, with 40 characters of slack at the
+end for words added after it. It splits both texts into words, aligns
+them on their longest common subsequence, and where a run of words was
+replaced by a run of the same length, pairs the words up in order. A pair
+is a correction when
+
+- both words are letters, apostrophes and hyphens only, so numbers, paths
+  and symbols never count;
+- they differ;
+- and they are the same word ignoring case and diacritics ("parla" to
+  "Parla", "Zurich" to "Zürich"), or their edit distance is at most 34%
+  of the longer word's length ("Emanuel" to "Emanuele", "wisper" to
+  "Wispr"). "Monday" to "Tuesday" is a different word, not a spelling.
+
+Inserted and deleted words do not count. Neither does a dictation that
+was scratched, rewritten by a voice edit, or typed into a field that
+cannot be read any more, and a password field is never read. A pair the
+dictionary already produces (the written form is one of the words, or a
+replacement exists for the heard word) is skipped, and so is one you
+dismissed.
+
+What survives goes into `~/.local/share/parla/learned.toml`:
+
+```toml
+dismissed = ["monday->Mondays"]
+
+[[suggestion]]
+heard = "Emanuel"
+written = "Emanuele"
+count = 2
+last_at_ms = 1758190000123
+app = "kmail"
+```
+
+`count` grows each time the same correction is seen; `app` is the
+application it was seen in last, as its toolkit names it. `dismissed`
+holds the keys of pairs turned down, the heard word lowercased and the
+written word as is, so a dismissed pair stays away however it is
+capitalised next time. Every recorded pair is logged at info.
+
+`flow.learn` picks what happens next. With `suggest`, the default, the
+file is all that changes, and the UI's Dictionary page lists the pairs
+with Accept and Dismiss. Accept puts the written form into `words` and
+the pair into `replace`, saves the dictionary, and asks the daemon to
+reload. With `auto`, the daemon moves a pair seen twice into the dictionary the
+same way, reloads the files, and sends a notification saying "Learned:
+Emanuel -> Emanuele". With `off`, nothing is
+read back. Learning needs `desktopd.a11y`; it works with `flow.context`
+off, since the field is read either way.
 
 ## History
 

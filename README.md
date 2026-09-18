@@ -66,7 +66,10 @@ For a while after a dictation, the command hotkey takes it back: "scratch
 that" deletes it, and "make that more formal", "shorter" or "turn that
 into bullet points" rewrite it in place. Before deleting, parla reads the
 field again and checks the dictation is still at the end of it, allowing
-for an autocorrected word; a field that has changed is left alone.
+for an autocorrected word; a field that has changed is left alone. parla
+also notices a word you fix by hand after dictating it ("Emanuel" to
+"Emanuele") and offers it for the dictionary, or adds it on the second
+time if the config says so.
 
 ```
 parlad --flow "um so send it monday no tuesday" org.kde.konsole
@@ -164,8 +167,6 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
 
 ## Not done yet
 
-- **The dictionary does not learn.** A correction you type after a
-  dictation is not noticed. Names go into the dictionary by hand.
 - **The daemon and the UI have run together only against the mock.** The
   bus contract is tested end to end, but the first real session with both
   is still ahead.

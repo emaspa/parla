@@ -524,7 +524,9 @@ fn start_capture(capture: &mut Option<Capture>, mode: Mode, ctx: &LoopCtx<'_>) -
         Ok(session) => {
             tracing::debug!("{mode:?} capture starting");
             let executor = Arc::clone(ctx.executor);
-            let want_text = cfg.flow.context && mode == Mode::Dictate;
+            // Both cleanup's context and learning read the field.
+            let want_text = (cfg.flow.context || cfg.flow.learn != config::LearnMode::Off)
+                && mode == Mode::Dictate;
             let focus = tokio::spawn(async move {
                 let text = async {
                     if want_text {
@@ -1021,6 +1023,10 @@ async fn check() -> anyhow::Result<()> {
         }
     }
     println!("history:       {}", if cfg.flow.history { parla_flow::paths::history().display().to_string() } else { "off".into() });
+    match parla_flow::Suggestions::load(&parla_flow::paths::learned()) {
+        Ok(s) => println!("learned:       {} suggestions, {} dismissed ({}, learn = {})", s.suggestions.len(), s.dismissed.len(), parla_flow::paths::learned().display(), cfg.flow.learn),
+        Err(e) => println!("learned:       FAILED: {e:#}"),
+    }
     println!(
         "hotkeys:       dictate={} command={} (parsed: {:#x} {:#x})",
         cfg.hotkeys.dictate,

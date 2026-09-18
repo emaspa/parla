@@ -7,14 +7,18 @@ import org.parla.ui
 
 // The personal dictionary: words whisper should spell right, and
 // spoken-to-written replacements. Saved on every change, then reloaded
-// by the daemon.
+// by the daemon. At the top, the corrections the daemon noticed after
+// dictations, each to accept into the dictionary or dismiss.
 FormCard.FormCardPage {
     id: page
     title: "Dictionary"
 
     property var words: []
     property var replacements: []
+    property var suggestions: []
     property string fileError: ""
+
+    Format { id: fmt }
 
     function load() {
         const json = Store.loadDictionary();
@@ -61,7 +65,45 @@ FormCard.FormCardPage {
         replacements = replacements.filter((_, k) => k !== i);
         save();
     }
-    Component.onCompleted: load()
+    function loadSuggestions() {
+        const json = Store.loadSuggestions();
+        if (json === "") {
+            fileError = Store.lastError;
+            return;
+        }
+        suggestions = JSON.parse(json);
+    }
+    function acceptSuggestion(key) {
+        if (!Store.acceptSuggestion(key)) {
+            fileError = Store.lastError;
+            return;
+        }
+        fileError = "";
+        Daemon.reload();
+        load();
+        loadSuggestions();
+    }
+    function dismissSuggestion(key) {
+        if (!Store.dismissSuggestion(key)) {
+            fileError = Store.lastError;
+            return;
+        }
+        fileError = "";
+        loadSuggestions();
+    }
+    Component.onCompleted: { load(); loadSuggestions(); }
+
+    // The daemon writes learned.toml a while after an utterance; look
+    // when one lands and again once its correction pass has had time.
+    Connections {
+        target: Daemon
+        function onUtterance(json) { page.loadSuggestions(); learnedRefresh.restart(); }
+    }
+    Timer {
+        id: learnedRefresh
+        interval: 25000
+        onTriggered: page.loadSuggestions()
+    }
 
     actions: [
         Kirigami.Action {
@@ -82,6 +124,65 @@ FormCard.FormCardPage {
         visible: page.fileError !== ""
         type: Kirigami.MessageType.Error
         text: page.fileError
+    }
+
+    FormCard.FormHeader {
+        title: "Suggested from your corrections"
+        visible: page.suggestions.length > 0
+    }
+    FormCard.FormCard {
+        visible: page.suggestions.length > 0
+        FormCard.AbstractFormDelegate {
+            background: null
+            contentItem: QQC2.Label {
+                text: "Words you changed by hand right after dictating them. Accept adds the spelling to the words and a replacement for what was heard."
+                wrapMode: Text.WordWrap
+                opacity: 0.7
+            }
+        }
+        Repeater {
+            model: page.suggestions
+            FormCard.AbstractFormDelegate {
+                id: srow
+                required property var modelData
+                required property int index
+                background: null
+                contentItem: RowLayout {
+                    spacing: Kirigami.Units.largeSpacing
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+                        RowLayout {
+                            spacing: Kirigami.Units.smallSpacing
+                            QQC2.Label { text: srow.modelData.heard }
+                            Kirigami.Icon {
+                                source: "arrow-right"
+                                Layout.preferredWidth: Kirigami.Units.iconSizes.small
+                                Layout.preferredHeight: Kirigami.Units.iconSizes.small
+                            }
+                            QQC2.Label { text: srow.modelData.written; font.bold: true }
+                        }
+                        QQC2.Label {
+                            text: (srow.modelData.count === 1 ? "once" : srow.modelData.count + " times")
+                                  + (srow.modelData.app !== "" ? ", last in " + srow.modelData.app : "")
+                                  + ", " + fmt.timeAgo(srow.modelData.last_at_ms)
+                            opacity: 0.7
+                            font: Kirigami.Theme.smallFont
+                        }
+                    }
+                    QQC2.Button {
+                        icon.name: "dialog-ok"
+                        text: "Accept"
+                        onClicked: page.acceptSuggestion(srow.modelData.key)
+                    }
+                    QQC2.ToolButton {
+                        icon.name: "dialog-cancel"
+                        text: "Dismiss"
+                        onClicked: page.dismissSuggestion(srow.modelData.key)
+                    }
+                }
+            }
+        }
     }
 
     FormCard.FormHeader { title: "Words" }

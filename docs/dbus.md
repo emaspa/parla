@@ -66,7 +66,7 @@ b` says whether the record existed. `ClearHistory()` empties the file.
 `flow.history = false` these return empty results.
 
 `Paths() -> s` returns a JSON object of absolute paths: `config`,
-`dictionary`, `snippets`, `apps`, `history`.
+`dictionary`, `snippets`, `apps`, `history`, `learned`.
 
 `Preview(s text, s app) -> s` runs the dictation cleanup on `text` as if it
 had been dictated into a window of class `app` and returns the result

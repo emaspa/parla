@@ -275,7 +275,34 @@ pub struct FlowConfig {
     /// tell the cleanup model what the dictation continues. Needs
     /// `desktopd.a11y`; does nothing for a password field or the code tone.
     pub context: bool,
+    /// What happens when a word is changed in the field right after a
+    /// dictation. `suggest` records the pair in `learned.toml` for the UI
+    /// to offer; `auto` also moves a pair seen twice into the dictionary;
+    /// `off` reads nothing back. Needs `desktopd.a11y`.
+    pub learn: LearnMode,
+    /// How long after a dictation the field is read again for corrections.
+    pub learn_after_ms: u64,
     pub openai: OpenAiConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LearnMode {
+    /// Record corrections; the UI offers them for the dictionary.
+    Suggest,
+    /// Record them, and put a pair seen twice into the dictionary.
+    Auto,
+    Off,
+}
+
+impl std::fmt::Display for LearnMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            LearnMode::Suggest => "suggest",
+            LearnMode::Auto => "auto",
+            LearnMode::Off => "off",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +343,8 @@ impl Default for FlowConfig {
             history: true,
             edit_window_ms: 90_000,
             context: true,
+            learn: LearnMode::Suggest,
+            learn_after_ms: 20_000,
             openai: OpenAiConfig::default(),
         }
     }
@@ -563,6 +592,7 @@ impl DaemonConfig {
         let fl = &self.flow;
         anyhow::ensure!(fl.timeout_ms > 0, "flow.timeout_ms must be > 0");
         anyhow::ensure!(fl.max_tokens > 0, "flow.max_tokens must be > 0");
+        anyhow::ensure!(fl.learn_after_ms > 0, "flow.learn_after_ms must be > 0");
         anyhow::ensure!(
             !fl.openai.base_url.trim().is_empty(),
             "flow.openai.base_url must not be empty"
@@ -718,5 +748,22 @@ mod tests {
         assert!(text.contains("[flow.openai]"), "{text}");
         let cfg: DaemonConfig = toml::from_str("[flow]\nbackend = \"openai\"\n").unwrap();
         assert_eq!(cfg.flow.backend, FlowBackend::OpenAi);
+    }
+
+    #[test]
+    fn learn_mode_round_trips() {
+        let text = DaemonConfig::default_toml().unwrap();
+        assert!(text.contains("learn = \"suggest\""), "{text}");
+        assert!(text.contains("learn_after_ms = 20000"), "{text}");
+        let cfg: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.flow.learn, LearnMode::Suggest);
+        let cfg: DaemonConfig = toml::from_str("[flow]\nlearn = \"auto\"\n").unwrap();
+        assert_eq!(cfg.flow.learn, LearnMode::Auto);
+        let cfg: DaemonConfig = toml::from_str("[flow]\nlearn = \"off\"\n").unwrap();
+        assert_eq!(cfg.flow.learn, LearnMode::Off);
+        assert!(toml::from_str::<DaemonConfig>("[flow]\nlearn = \"always\"\n").is_err());
+        let mut c = DaemonConfig::default();
+        c.flow.learn_after_ms = 0;
+        assert!(c.validate().is_err());
     }
 }

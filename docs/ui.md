@@ -45,7 +45,16 @@ daemon in pages.
 
 **Dictionary.** The word list and the replacement pairs, editable in place.
 Save writes `dictionary.toml` and asks the daemon to reload; a parse error
-from the daemon appears as a notification with the file and line.
+from the daemon appears as a notification with the file and line. Above
+them, when there are any, "Suggested from your corrections" lists the
+words the daemon saw changed by hand after a dictation, with how often,
+where and when. Accept adds the spelling to the words and a replacement
+from what was heard, saves both files and reloads the daemon; Dismiss
+drops the pair for good. The page reads `learned.toml` when it opens, after each
+utterance, and 25 seconds after that, once the daemon has had time to
+look at the field.
+
+![The Dictionary page with a suggestion waiting](img/dictionary-suggestions.png)
 
 **Snippets.** Trigger and text pairs, with a multi-line editor for the text.
 
@@ -88,8 +97,9 @@ either the daemon's (state, history) or one of the TOML files.
 The application is Rust. cxx-qt exposes two QML singletons: `Daemon`, the
 bus client, whose properties mirror the daemon's and whose invokables map
 one to one onto its methods, and `Store`, which loads and saves the three
-TOML files through the same parla-flow types the daemon uses, so a file the
-UI wrote and a file edited by hand parse the same way. A short C++ shim
+TOML files and the learned suggestions through the same parla-flow types
+the daemon uses, so a file the UI wrote and a file edited by hand parse the
+same way. A short C++ shim
 creates the `QApplication`, the tray item and the QML engine. The QML
 lives in `crates/ui/qml` and is compiled into the binary, so the release
 build is one self-contained executable.

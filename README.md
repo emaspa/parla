@@ -171,5 +171,4 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
 
 ## License
 
-MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
-[LICENSE-APACHE](LICENSE-APACHE).
+MIT. See [LICENSE](LICENSE).

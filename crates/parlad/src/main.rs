@@ -37,8 +37,8 @@ use asr::Asr;
 use audio::CaptureSession;
 use config::DaemonConfig;
 use dbus::{Bus, Control, Notice, State};
-use desktopd::{Executor, Window};
-use flow::Flow;
+use desktopd::{A11y, Executor, FocusedText, Window};
+use flow::{Flow, TextContext};
 use hotkeys::{HotkeyEvent, HotkeyManager};
 use local::LocalModel;
 use parla_flow::Record;
@@ -149,9 +149,41 @@ async fn run() -> anyhow::Result<()> {
     let cfg = Arc::new(DaemonConfig::load()?);
 
     tracing::info!("starting executor (injector probe, desktop index)...");
-    let executor = Arc::new(Executor::new(cfg.desktopd.clone()).await?);
+    let executor = Executor::new(cfg.desktopd.clone()).await?;
     tracing::info!("input injector: {}", executor.injector_name());
 
+    // The a11y flag is set here and cleared on the way out, whatever the
+    // way out is, so a failed start does not leave it on.
+    let a11y = connect_a11y(&cfg).await;
+    let executor = Arc::new(executor.with_a11y(a11y.clone()));
+    let outcome = serve(instance, cfg, executor).await;
+    if let Some(a11y) = a11y {
+        a11y.shutdown().await;
+    }
+    outcome
+}
+
+/// The accessibility bus, when the config wants it. Not fatal: without it
+/// cleanup does not see the text around the cursor and edits are blind.
+async fn connect_a11y(cfg: &DaemonConfig) -> Option<Arc<A11y>> {
+    if !cfg.desktopd.a11y {
+        tracing::info!("a11y off in the config; cleanup will not see the text around the cursor");
+        return None;
+    }
+    match A11y::connect(true).await {
+        Ok(a) => Some(Arc::new(a)),
+        Err(e) => {
+            tracing::warn!("a11y unavailable ({e:#}); cleanup will not see the text around the cursor");
+            None
+        }
+    }
+}
+
+async fn serve(
+    instance: instance::InstanceLock,
+    cfg: Arc<DaemonConfig>,
+    executor: Arc<Executor>,
+) -> anyhow::Result<()> {
     let grammar = Arc::new(load_grammar(&cfg)?);
 
     tracing::info!("loading whisper model...");
@@ -405,16 +437,24 @@ struct Capture {
     session: CaptureSession,
     /// When the hold is treated as released even without a Released signal.
     deadline: Instant,
-    /// The window that had focus when the key went down, looked up in the
-    /// background so the capture starts without waiting on kdotool.
-    focus: tokio::task::JoinHandle<Option<Window>>,
+    /// What had focus when the key went down, looked up in the background
+    /// so the capture starts without waiting on kdotool or the a11y bus.
+    focus: tokio::task::JoinHandle<Focus>,
+}
+
+/// Where the text will land: the focused window, and the focused text
+/// field when the a11y bus can read one.
+#[derive(Default)]
+struct Focus {
+    window: Option<Window>,
+    text: Option<FocusedText>,
 }
 
 /// A finished capture, queued for transcription and routing.
 struct Job {
     mode: Mode,
     samples: audio::Stopped,
-    focus: tokio::task::JoinHandle<Option<Window>>,
+    focus: tokio::task::JoinHandle<Focus>,
 }
 
 /// Resolves when the active capture's device opens or fails; pends for ever
@@ -479,7 +519,21 @@ fn start_capture(capture: &mut Option<Capture>, mode: Mode, ctx: &LoopCtx<'_>) -
         Ok(session) => {
             tracing::debug!("{mode:?} capture starting");
             let executor = Arc::clone(ctx.executor);
-            let focus = tokio::spawn(async move { executor.active_window().await.ok().flatten() });
+            let want_text = cfg.flow.context && mode == Mode::Dictate;
+            let focus = tokio::spawn(async move {
+                let text = async {
+                    if want_text {
+                        executor.focused_text().await
+                    } else {
+                        None
+                    }
+                };
+                let (window, text) = tokio::join!(executor.active_window(), text);
+                Focus {
+                    window: window.ok().flatten(),
+                    text,
+                }
+            });
             *capture = Some(Capture {
                 mode,
                 session,
@@ -565,7 +619,8 @@ async fn worker(
     }) = jobs.recv().await
     {
         let t0 = std::time::Instant::now();
-        let focused = focus.await.ok().flatten();
+        let focus = focus.await.unwrap_or_default();
+        let focused = focus.window;
         let heard = match transcribe(samples, &cfg.audio, &gate, &asr, router.flow()).await {
             Ok(h) => h,
             Err(e) => {
@@ -580,7 +635,9 @@ async fn worker(
             report(&cfg, bus.as_ref(), mode, Err(anyhow::anyhow!("session locked; utterance discarded")));
             continue;
         }
-        let result = router.handle(mode, &heard.transcript, focused.as_ref()).await;
+        let result = router
+            .handle(mode, &heard.transcript, focused.as_ref(), focus.text.as_ref())
+            .await;
         let latency_ms = t0.elapsed().as_millis() as u64;
         let record = record_of(mode, &heard, focused.as_ref(), &result, latency_ms);
         if let Some(record) = router.flow().record(record) {
@@ -850,8 +907,11 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
 /// `parlad --flow "<text>" [window class]`: run one transcript through the
 /// dictation flow (snippets, dictionary, cleanup for that window class) and
 /// print what would be typed, without typing it. The way to try a profile's
-/// instructions or a dictionary entry. With `--edit "<text>" "<instruction>"`
-/// it applies a spoken edit to `text` instead.
+/// instructions or a dictionary entry. `PARLA_CONTEXT_BEFORE` in the
+/// environment stands in for the text before the cursor, so the context
+/// section of the prompt can be tried without a live field. With
+/// `--edit "<text>" "<instruction>"` it applies a spoken edit to `text`
+/// instead.
 async fn flow_once(text: &str, instruction: Option<&str>, class: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !text.trim().is_empty() && instruction.is_none_or(|i| !i.trim().is_empty()),
@@ -887,7 +947,18 @@ async fn flow_once(text: &str, instruction: Option<&str>, class: &str) -> anyhow
             println!("would type: {out:?}");
         }
         None => {
-            let out = flow.process(text, class).await;
+            let context = std::env::var("PARLA_CONTEXT_BEFORE")
+                .ok()
+                .map(|before| TextContext {
+                    app: "an application".into(),
+                    role: "text field".into(),
+                    before,
+                });
+            match &context {
+                Some(c) => println!("context:    before the cursor {:?}", c.before),
+                None => println!("context:    none (set PARLA_CONTEXT_BEFORE to try one)"),
+            }
+            let out = flow.process(text, class, context.as_ref()).await;
             println!("outcome:    {} in {:.0}ms", out.outcome, t0.elapsed().as_secs_f64() * 1000.0);
             println!("would type: {:?}", out.text);
         }
@@ -967,6 +1038,10 @@ async fn check() -> anyhow::Result<()> {
     }
     let conn = desktopd::bus::session().await?;
     println!("session locked: {}", lock::is_locked(&conn).await);
+    match A11y::status().await {
+        Ok(enabled) => println!("a11y:          bus reachable, IsEnabled={enabled}"),
+        Err(e) => println!("a11y:          unavailable ({e:#})"),
+    }
     let owned = zbus::fdo::DBusProxy::new(&conn)
         .await?
         .name_has_owner(dbus::NAME.try_into()?)

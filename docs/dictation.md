@@ -2,8 +2,10 @@
 
 Hold the dictation hotkey (`ctrl+space` by default), speak, release. What
 whisper heard goes through snippets, the dictionary and cleanup, in that
-order, and lands in the focused window as keystrokes. This page is the whole
-path from transcript to text, and the two ways of taking it back.
+order, and lands in the focused window as keystrokes. When the focused text
+field can be read over the accessibility bus, the model also sees what is
+before the cursor. This page is the whole path from transcript to text, and
+the two ways of taking it back.
 
 ## The order of things
 
@@ -13,15 +15,24 @@ path from transcript to text, and the two ways of taking it back.
 3. Dictionary replacements are applied to the transcript.
 4. The window class of the focused window picks an app profile. If the
    profile has cleanup on and `flow.cleanup` is on, the model rewrites the
-   transcript with that profile's tone and instructions. Otherwise spoken
-   "new line" and "new paragraph" become breaks and the text is done.
+   transcript with that profile's tone and instructions. With
+   `flow.context` on, and a text field that was readable over AT-SPI when
+   the hotkey went down, the prompt also carries the last 300 characters
+   before the cursor; see [What the model sees of the
+   screen](#what-the-model-sees-of-the-screen). Otherwise spoken "new
+   line" and "new paragraph" become breaks and the text is done.
 5. The model's output is checked. Empty output, or output more than twice
    the transcript's length plus 40 characters, is rejected and the raw
    transcript is typed instead. So is the raw transcript when the model
    errors or exceeds `flow.timeout_ms`.
 6. Dictionary replacements run once more over the cleaned text, since the
    model may have re-spelled something.
-7. The text is typed, and a history record is written.
+7. If the field was read, a space goes in front of the text when the
+   character before the cursor is not whitespace, a line break, an opening
+   bracket or a quote, and the text does not itself start with whitespace
+   or punctuation. With the code tone, no space follows any other symbol
+   either, so a path stays one path.
+8. The text is typed, and a history record is written.
 
 Everything in this file is exercised without a microphone or a focused
 window by
@@ -179,6 +190,53 @@ On an RTX 5060 with Qwen3-4B, a one-sentence cleanup takes 120 to 270 ms
 after the model is warm. The first dictation after startup is slower while
 the prompt is decoded into the KV cache.
 
+## What the model sees of the screen
+
+Toolkits expose their widgets on the session's accessibility bus (AT-SPI):
+Qt, GTK, Firefox, Chromium and Electron all do, but only once
+`org.a11y.Status.IsEnabled` is true on that bus, which is what a screen
+reader sets. With `desktopd.a11y` on, parlad sets it at startup, follows
+focus over the bus, and clears the flag again at shutdown if it was parlad
+that set it.
+
+When the dictation hotkey goes down, the focused text field is read in the
+same background task that looks up the focused window: the application's
+name, the field's role, the caret position, and up to 600 characters
+before the caret and 200 after. Every call to the application is bounded
+by 300 ms, so a hung application costs a dictation its context and
+nothing else. A password field is recognised by its role and its text is
+never read.
+
+With `flow.context` on, the cleanup prompt then ends with a section like
+
+```
+The cursor is in an entry in Thunderbird. The text before the cursor ends
+with: "Hi Alan,
+
+thanks for the". Continue that text: match its language, register and
+capitalisation; if it ends mid-sentence, do not start with a capital; do
+not repeat any of it.
+```
+
+quoting the last 300 characters. An empty field is described as empty.
+The section comes last in the prompt so the local model's KV cache keeps
+the part that never changes. Profiles with the code tone skip it: a
+terminal's screen is not prose to continue, and the leading-space rule is
+all that applies there. The output check in step 5 still runs, so a model
+that answers the context instead of cleaning the transcript is caught by
+the length limit.
+
+```
+PARLA_CONTEXT_BEFORE="Hi Alan, thanks for the" parlad --flow "um quick reply" org.kde.thunderbird
+```
+
+tries the prompt without a live field: the variable stands in for the text
+before the cursor. `parla-probe context` shows what parlad would read from
+the field that has focus right now, or "no focused text field".
+
+With `flow.backend = "openai"` the 300 characters go to the server with
+the transcript. That is one more reason to keep the local backend.
+
 ## Taking it back
 
 For `flow.edit_window_ms` after a dictation (90 seconds by default), and as
@@ -186,11 +244,21 @@ long as the same window still has focus, the command hotkey accepts two
 kinds of follow-up.
 
 "Scratch that", "delete that", "undo that", "undo" or "erase that" are
-grammar matches. parla sends as many backspaces as it typed characters,
-and the history records a command that took back that many. The count is
-what parla typed, so an application that autocorrected or autocompleted in between is
-left with a mess. This is the one place where the daemon acts on the screen
-blind.
+grammar matches. Before deleting, parla reads the focused field over the
+accessibility bus and checks that the text before the cursor still ends
+with what it typed. If it does, that many backspaces are sent and the
+result says "took back 42 characters (verified)". If an application
+changed a little of it in the meantime (autocorrect, a capital letter,
+a bracket completed), the closest suffix is found instead: every length
+within 30% of the typed length is scored by Levenshtein similarity, and
+the best one is deleted if it scores at least 0.8, reported as "took back
+44 characters (verified; 42 were typed)". If nothing at the end of the
+field resembles the dictation, nothing is deleted and the command is
+refused with "the text has changed since it was dictated". When the field
+cannot be read at all (no accessibility bridge in that application,
+`desktopd.a11y` off, a password field), parla falls back to sending as
+many backspaces as it typed characters, reported as "(unverified)".
+Deletion is always keystrokes; the bus is only read.
 
 Anything else in command mode goes to the judged path, which is offered an
 extra intent, `edit_text`, only while a recent dictation exists. Its
@@ -203,8 +271,9 @@ with the edit prompt: apply the instruction, output only the result, keep
 everything the instruction does not ask to change, and if the instruction
 is a question or not about the text, output the text unchanged. The
 dictionary's words are included, and the code tone adds "keep it literal".
-parla backspaces the old text and types the new. An edit that fails is
-reported and nothing is typed. Edits never ask for confirmation: the text
+parla takes back the old text with the same verification as "scratch
+that" and types the new; a field that no longer ends with the dictation
+refuses the edit. An edit that fails is reported and nothing is typed. Edits never ask for confirmation: the text
 is the user's own words of a moment ago, and can be dictated again.
 
 ```

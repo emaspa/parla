@@ -28,6 +28,7 @@ by restarting; see [dictation.md](dictation.md).
 | `XDG_DATA_HOME` | Where `parla/models` and `parla/history.jsonl` live. Default `~/.local/share`. |
 | `XDG_STATE_HOME` | Where the single-instance lock lives. Default `~/.local/state`. |
 | `PARLA_LAST_DICTATION` | Set to anything to make `parlad --judge` behave as if text was dictated a moment ago, so edit phrases can be tested. |
+| `PARLA_CONTEXT_BEFORE` | Text `parlad --flow` treats as what is before the cursor, so the context section of the cleanup prompt can be tried without a live field. |
 
 ## Files
 
@@ -241,6 +242,7 @@ timeout_ms = 6000
 max_tokens = 1024
 history = true
 edit_window_ms = 90000
+context = true
 
 [flow.openai]
 base_url = "https://api.openai.com/v1"
@@ -271,6 +273,15 @@ pages stay empty and nothing about what was said is written to disk.
 that shorter" still refer to it. The reference also dies when focus moves
 to another window.
 
+`context` reads the focused text field over the accessibility bus when the
+dictation hotkey goes down and tells the cleanup model what is before the
+cursor, so the dictation continues it in the same language, register and
+capitalisation, and gets a leading space when it needs one. It needs
+`desktopd.a11y`. Nothing is read from a password field, and profiles with
+the code tone get the leading-space rule only. With the OpenAI backend the
+text before the cursor is sent with the transcript. The details are in
+[dictation.md](dictation.md).
+
 ## `[desktopd]`
 
 ```toml
@@ -281,6 +292,7 @@ claude_tmux_session = "claude-main"
 claude_command = "claude"
 injectors = ["eis", "ydotool"]
 focus_if_running = true
+a11y = true
 ```
 
 `terminal` and `terminal_run_args` are what "open terminal" runs and how it
@@ -297,3 +309,11 @@ daemon's lifetime, and `--check` reports which one that is.
 
 `focus_if_running` makes a launch of an application that already has a
 window focus that window instead of starting a second copy.
+
+`a11y` connects to the session's accessibility bus at startup and sets
+`org.a11y.Status.IsEnabled`, the flag that makes Qt, GTK, Firefox and
+Chromium expose their text fields, when it is not already set. A flag
+parlad set is cleared again at shutdown. The connection is what
+`flow.context` and verified "scratch that" read from; off, cleanup does not
+see the screen and edits delete as many characters as were typed. A bus
+that cannot be reached is logged and the daemon runs without it.

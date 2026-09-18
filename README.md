@@ -57,9 +57,16 @@ and adds no trailing period, `casual` for chat keeps contractions and
 invents no sign-offs, `formal` for mail writes complete sentences and
 paragraphs. Profiles carry free-text instructions on top.
 
+When the application exposes its text field over the accessibility bus,
+as Qt, GTK, Firefox and Chromium do, the model is also shown the text
+before the cursor and told to continue it in the same language, register
+and capitalisation.
+
 For a while after a dictation, the command hotkey takes it back: "scratch
 that" deletes it, and "make that more formal", "shorter" or "turn that
-into bullet points" rewrite it in place.
+into bullet points" rewrite it in place. Before deleting, parla reads the
+field again and checks the dictation is still at the end of it, allowing
+for an autocorrected word; a field that has changed is left alone.
 
 ```
 parlad --flow "um so send it monday no tuesday" org.kde.konsole
@@ -156,11 +163,6 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
   the TypeSafe backend and never checked against a corpus of real
   utterances, on either backend. The local model's probabilities cluster
   at 0 and 1, which makes them blunt.
-- **Voice edits replace text by backspacing.** "Scratch that" deletes as
-  many characters as parla typed. An application that rewrote the text in
-  the meantime, with autocorrect or autocomplete, is left with a mess.
-- **Cleanup does not see the screen.** Wispr Flow reads the text around
-  the cursor to match its style; parla knows only the window class.
 - **The dictionary does not learn.** A correction you type after a
   dictation is not noticed. Names go into the dictionary by hand.
 - **The daemon and the UI have run together only against the mock.** The

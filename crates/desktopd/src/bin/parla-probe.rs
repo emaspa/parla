@@ -8,6 +8,7 @@
 //!   parla-probe resolve QUERY       # which window QUERY would target (no action)
 //!   parla-probe desktops            # list virtual desktops, mark current
 //!   parla-probe apps QUERY          # resolve QUERY against the .desktop index
+//!   parla-probe context             # the focused text field over AT-SPI (read-only)
 //!   parla-probe type TEXT           # type into the FOCUSED window (careful)
 //!   parla-probe key CHORD           # send a key chord ("ctrl+s")
 //!   parla-probe shortcut COMP ACT   # invoke a kglobalaccel shortcut
@@ -69,6 +70,47 @@ async fn main() -> anyhow::Result<()> {
                 Ok(e) => println!("{} -> {} ({})", query, e.name, e.id),
                 Err(err) => println!("{query} -> no match ({err})"),
             }
+        }
+        "context" => {
+            // Enables org.a11y.Status.IsEnabled if it is off, and puts it
+            // back on exit. Toolkits that were started before the flag was
+            // set may or may not have loaded their bridge yet.
+            let a11y = desktopd::A11y::connect(true).await?;
+            println!(
+                "a11y bus: connected (IsEnabled {})",
+                if a11y.enabled_by_us() { "set by this probe" } else { "was already true" }
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut found = None;
+            loop {
+                match a11y.focused_text().await {
+                    Ok(Some(t)) => {
+                        found = Some(t);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => println!("read failed: {e:#}"),
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            match found {
+                Some(t) => {
+                    println!("app:     {}", t.app);
+                    println!("role:    {}", t.role);
+                    println!("caret:   {} of {} chars", t.caret, t.length);
+                    if t.password {
+                        println!("password field: text not read");
+                    } else {
+                        println!("before:  {:?}", t.before);
+                        println!("after:   {:?}", t.after);
+                    }
+                }
+                None => println!("no focused text field"),
+            }
+            a11y.shutdown().await;
         }
         "type" => {
             let text = args.get(1).context("usage: type TEXT")?;

@@ -9,6 +9,10 @@
 //! content, and when it fails or times out the raw transcript is typed
 //! instead, so a slow model costs latency, never words.
 //!
+//! When the focused text field can be read over AT-SPI, the model is also
+//! told what comes before the cursor, so the dictation continues it in the
+//! same language and register; see [`TextContext`].
+//!
 //! The same model applies a spoken instruction to the text just dictated
 //! ("make that more formal"); see [`Flow::edit`].
 
@@ -41,6 +45,41 @@ translate, or add anything that was not said.
 - Plain text only: no markdown headings, bold or code fences. A list is lines starting with \
 \"- \" or the numbers the speaker used.
 - If the text is already clean, return it unchanged.";
+
+/// How much of the text before the cursor the model is shown.
+const CONTEXT_CHARS: usize = 300;
+
+/// The text field a dictation lands in, as far as the cleanup model is
+/// told: where the cursor is and what comes before it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextContext {
+    /// The application's name, as its toolkit reports it.
+    pub app: String,
+    /// The AT-SPI role name of the field ("text", "entry", "terminal").
+    pub role: String,
+    /// The text before the cursor, as much of it as was read.
+    pub before: String,
+}
+
+impl TextContext {
+    /// A context for a field, or None for a password field: what is in
+    /// one never reaches a prompt.
+    pub fn new(app: &str, role: &str, password: bool, before: &str) -> Option<Self> {
+        if password {
+            return None;
+        }
+        Some(Self {
+            app: app.to_string(),
+            role: role.to_string(),
+            before: before.to_string(),
+        })
+    }
+
+    /// From a field read over AT-SPI.
+    pub fn from_focused(t: &desktopd::FocusedText) -> Option<Self> {
+        Self::new(&t.app, &t.role, t.password, &t.before)
+    }
+}
 
 const EDIT_PROMPT: &str = "You edit text for a person who dictates by voice. You are given the \
 current text and an instruction they spoke. Apply the instruction to the text and output only \
@@ -98,6 +137,8 @@ pub struct Flow {
     timeout: Duration,
     max_tokens: u32,
     edit_window: Duration,
+    /// Tell the model what is before the cursor, when it can be read.
+    context: bool,
     store: RwLock<Store>,
     history: Option<Mutex<History>>,
     /// `asr.initial_prompt` from the config; the dictionary's words follow it.
@@ -153,6 +194,7 @@ impl Flow {
             timeout,
             max_tokens: cfg.max_tokens,
             edit_window: Duration::from_millis(cfg.edit_window_ms),
+            context: cfg.context,
             store: RwLock::new(store),
             history: cfg
                 .history
@@ -186,6 +228,11 @@ impl Flow {
         self.edit_window
     }
 
+    /// Whether the text around the cursor is read and given to the model.
+    pub fn context_enabled(&self) -> bool {
+        self.context
+    }
+
     /// What whisper is primed with: the configured prompt, then the
     /// dictionary's words, so names are transcribed as they are spelled.
     pub fn asr_prompt(&self) -> Option<String> {
@@ -207,7 +254,32 @@ impl Flow {
     }
 
     /// Turn a transcript into what gets typed into a window of `class`.
-    pub async fn process(&self, transcript: &str, class: &str) -> Processed {
+    /// With `context`, the model is told what is before the cursor (not
+    /// for the code tone: a terminal's screen is not prose to continue),
+    /// and the result gets a leading space when it would otherwise run
+    /// into the word before the cursor.
+    pub async fn process(
+        &self,
+        transcript: &str,
+        class: &str,
+        context: Option<&TextContext>,
+    ) -> Processed {
+        let mut out = self.process_inner(transcript, class, context).await;
+        if let Some(ctx) = context {
+            let code = self.profile_for(class).tone == parla_flow::Tone::Code;
+            if out.outcome != "snippet" && needs_space(&ctx.before, &out.text, code) {
+                out.text.insert(0, ' ');
+            }
+        }
+        out
+    }
+
+    async fn process_inner(
+        &self,
+        transcript: &str,
+        class: &str,
+        context: Option<&TextContext>,
+    ) -> Processed {
         let (snippet, replaced, profile, words) = {
             let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
             (
@@ -232,7 +304,8 @@ impl Flow {
         let Some(rewriter) = self.rewriter.as_ref().filter(|_| profile.cleanup) else {
             return raw();
         };
-        let system = cleanup_prompt(&profile, &words);
+        let context = context.filter(|_| profile.tone != parla_flow::Tone::Code);
+        let system = cleanup_prompt(&profile, &words, context);
         let t0 = std::time::Instant::now();
         match rewriter
             .generate(&system, &replaced, self.max_tokens, self.timeout)
@@ -337,7 +410,7 @@ impl Flow {
     }
 }
 
-fn cleanup_prompt(profile: &AppProfile, words: &[String]) -> String {
+fn cleanup_prompt(profile: &AppProfile, words: &[String], context: Option<&TextContext>) -> String {
     let mut system = CLEANUP_PROMPT.to_string();
     system.push_str("\n\n");
     system.push_str(profile.tone.guidance());
@@ -352,7 +425,71 @@ fn cleanup_prompt(profile: &AppProfile, words: &[String]) -> String {
             words.join(", ")
         ));
     }
+    // Last, so the local model's KV cache keeps the part that never changes.
+    if let Some(ctx) = context {
+        system.push_str("\n\n");
+        system.push_str(&context_section(ctx));
+    }
     system
+}
+
+/// The part of the prompt that says where the text is going.
+fn context_section(ctx: &TextContext) -> String {
+    let role = if ctx.role.trim().is_empty() {
+        "text field"
+    } else {
+        ctx.role.trim()
+    };
+    let article = if role.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    let mut s = format!("The cursor is in {article} {role}");
+    if !ctx.app.trim().is_empty() {
+        s.push_str(&format!(" in {}", ctx.app.trim()));
+    }
+    let tail = last_chars(&ctx.before, CONTEXT_CHARS);
+    if tail.trim().is_empty() {
+        s.push_str(". The field is empty before the cursor.");
+    } else {
+        s.push_str(&format!(
+            ". The text before the cursor ends with: \"{tail}\". Continue that text: match its \
+language, register and capitalisation; if it ends mid-sentence, do not start with a capital; \
+do not repeat any of it."
+        ));
+    }
+    s
+}
+
+fn last_chars(s: &str, n: usize) -> String {
+    let count = s.chars().count();
+    s.chars().skip(count.saturating_sub(n)).collect()
+}
+
+/// Whether `text`, typed at the cursor, needs a space first so it does not
+/// run into what is there. No space after whitespace, a line break, an
+/// opening bracket or quote, or into an empty field, and none when the
+/// text itself starts with whitespace or punctuation. With `code` on, no
+/// space after any other symbol either, so "path/" + "parla" stays one path.
+fn needs_space(before: &str, text: &str, code: bool) -> bool {
+    let Some(last) = before.chars().next_back() else {
+        return false;
+    };
+    let Some(first) = text.chars().next() else {
+        return false;
+    };
+    let symbol = |c: char| !c.is_alphanumeric() && !c.is_whitespace();
+    if last.is_whitespace() || "([{<\"'“‘«".contains(last) {
+        return false;
+    }
+    if first.is_whitespace() || symbol(first) {
+        return false;
+    }
+    if code && symbol(last) && !".,;:!?)]}".contains(last) {
+        return false;
+    }
+    true
 }
 
 /// The cleaned text, or None when the model's output cannot be trusted to
@@ -479,11 +616,77 @@ mod tests {
             instructions: "Prefer snake_case.".into(),
             ..AppProfile::default()
         };
-        let s = cleanup_prompt(&p, &["KWin".into(), "parla".into()]);
+        let s = cleanup_prompt(&p, &["KWin".into(), "parla".into()], None);
         assert!(s.contains("terminal or code editor"));
         assert!(s.ends_with("KWin, parla."));
         assert!(s.contains("Prefer snake_case."));
-        let s = cleanup_prompt(&AppProfile::fallback(), &[]);
+        let s = cleanup_prompt(&AppProfile::fallback(), &[], None);
         assert!(!s.contains("Spell these"));
+    }
+
+    #[test]
+    fn cleanup_prompt_describes_the_text_before_the_cursor() {
+        let ctx = TextContext {
+            app: "Thunderbird".into(),
+            role: "entry".into(),
+            before: "Hi Alan,\n\nthanks for the".into(),
+        };
+        let s = cleanup_prompt(&AppProfile::fallback(), &["KWin".into()], Some(&ctx));
+        assert!(s.contains("Spell these"));
+        assert!(
+            s.contains("KWin.\n\nThe cursor is in an entry in Thunderbird. The text before"),
+            "{s}"
+        );
+        assert!(
+            s.contains("ends with: \"Hi Alan,\n\nthanks for the\". Continue that text"),
+            "{s}"
+        );
+        assert!(s.ends_with("do not repeat any of it."));
+        // only the tail of a long field is quoted
+        let long = TextContext {
+            before: "x".repeat(1000),
+            ..ctx.clone()
+        };
+        let s = cleanup_prompt(&AppProfile::fallback(), &[], Some(&long));
+        assert!(s.contains(&format!("\"{}\"", "x".repeat(300))));
+        assert!(!s.contains(&"x".repeat(301)));
+        // an empty field is said to be empty
+        let empty = TextContext {
+            before: String::new(),
+            ..ctx
+        };
+        let s = cleanup_prompt(&AppProfile::fallback(), &[], Some(&empty));
+        assert!(s.ends_with("The field is empty before the cursor."), "{s}");
+        assert!(s.contains("in an entry in Thunderbird"));
+    }
+
+    #[test]
+    fn password_fields_give_no_context() {
+        assert_eq!(
+            TextContext::new("Firefox", "password text", true, "hunter2"),
+            None
+        );
+        let ctx = TextContext::new("Firefox", "entry", false, "hello").unwrap();
+        assert_eq!(ctx.before, "hello");
+    }
+
+    #[test]
+    fn leading_space_rule() {
+        assert!(needs_space("Hello", "world", false));
+        assert!(needs_space("Hello.", "World", false));
+        assert!(!needs_space("Hello ", "world", false));
+        assert!(!needs_space("Hello\n", "world", false));
+        assert!(!needs_space("", "world", false));
+        assert!(!needs_space("Hello", "", false));
+        assert!(!needs_space("Hello", ", world", false));
+        assert!(!needs_space("Hello", " world", false));
+        assert!(!needs_space("say (", "hello", false));
+        assert!(!needs_space("say \"", "hello", false));
+        // code: symbols join, closers do not
+        assert!(needs_space("echo foo", "bar", true));
+        assert!(!needs_space("cd ~/parla/", "crates", true));
+        assert!(!needs_space("git commit -m \"", "fix", true));
+        assert!(needs_space("ls;", "cd parla", true));
+        assert!(needs_space("a/", "b", false));
     }
 }

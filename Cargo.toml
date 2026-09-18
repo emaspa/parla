@@ -21,6 +21,15 @@ toml = "0.9"
 zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time"] }
 fuzzy-matcher = "0.3"
+# AT-SPI client for reading the focused text field: the three crates the
+# `atspi` 0.30 umbrella is made of, taken directly so atspi-connection's p2p
+# feature stays off (it spawns a peer listener that blocks the runtime and
+# prints to stderr). zbus stays the workspace one; the async-io feature these
+# pull in is additive and tokio wins at runtime.
+atspi-connection = { version = "0.14", default-features = false, features = ["wrappers"] }
+atspi-proxies = { version = "0.14", default-features = false }
+atspi-common = { version = "0.14", default-features = false, features = ["wrappers", "zbus"] }
+futures-lite = { version = "2", default-features = false }
 
 [profile.release]
 lto = "thin"

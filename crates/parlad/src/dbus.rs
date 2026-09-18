@@ -314,7 +314,7 @@ impl Daemon {
     }
 
     async fn preview(&self, text: &str, app: &str) -> zbus::fdo::Result<String> {
-        Ok(self.flow.process(text, app).await.text)
+        Ok(self.flow.process(text, app, None).await.text)
     }
 
     #[zbus(signal, name = "StateChanged")]

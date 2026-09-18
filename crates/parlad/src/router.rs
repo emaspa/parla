@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use desktopd::{Command, DesktopIndex, Executor, Window, WindowTarget};
+use desktopd::{Command, DesktopIndex, Executor, FocusedText, Verified, Window, WindowTarget};
 use parla_grammar::{Grammar, Intent};
 
 use crate::command::{from_intent, from_resolved};
 use crate::confirm::{check_target, Confirmations, Pending, Taken};
 use crate::dbus::{Bus, State};
-use crate::flow::{Flow, Processed};
+use crate::flow::{Flow, Processed, TextContext};
 use crate::judge::{Context, Judge, Verdict};
 use crate::policy::{Decision, Policy, Signals};
 
@@ -132,26 +132,45 @@ impl Router {
     }
 
     /// Handle a finished transcript. `focused` is the window that had focus
-    /// when the capture started, so dictation is shaped for where it lands.
+    /// when the capture started, so dictation is shaped for where it lands,
+    /// and `field` the text field read at the same moment, when there was
+    /// one to read.
     pub async fn handle(
         &self,
         mode: Mode,
         transcript: &str,
         focused: Option<&Window>,
+        field: Option<&FocusedText>,
     ) -> anyhow::Result<Handled> {
         let transcript = transcript.trim();
         anyhow::ensure!(!transcript.is_empty(), "empty transcript");
         match mode {
             // Dictation is not an answer: a pending prompt survives it.
-            Mode::Dictate => self.dictate(transcript, focused).await,
+            Mode::Dictate => self.dictate(transcript, focused, field).await,
             Mode::Command => self.route_command(transcript, focused).await,
         }
     }
 
-    async fn dictate(&self, transcript: &str, focused: Option<&Window>) -> anyhow::Result<Handled> {
+    async fn dictate(
+        &self,
+        transcript: &str,
+        focused: Option<&Window>,
+        field: Option<&FocusedText>,
+    ) -> anyhow::Result<Handled> {
         let class = focused.map(|w| w.class.as_str()).unwrap_or_default();
+        let context = field
+            .filter(|_| self.flow.context_enabled())
+            .and_then(TextContext::from_focused);
+        if let Some(c) = &context {
+            tracing::debug!(
+                "dictating into {} ({}), {} chars before the cursor",
+                c.app,
+                c.role,
+                c.before.chars().count()
+            );
+        }
         self.progress(State::Thinking, Mode::Dictate);
-        let processed = self.flow.process(transcript, class).await;
+        let processed = self.flow.process(transcript, class, context.as_ref()).await;
         self.progress(State::Typing, Mode::Dictate);
         self.executor.type_text(&processed.text).await?;
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastDictation {
@@ -288,17 +307,18 @@ impl Router {
     }
 
     /// "scratch that": take back the last dictation, if it is still recent
-    /// and the focus has not moved, by deleting as many characters as were
-    /// typed.
+    /// and the focus has not moved. The text before the cursor is checked
+    /// first when the field can be read; a field that no longer ends with
+    /// the dictation is left alone.
     async fn scratch(&self, focused: Option<&Window>) -> anyhow::Result<Handled> {
         let last = self
             .recent_dictation(focused)
             .ok_or_else(|| anyhow::anyhow!("nothing recent to take back"))?;
         self.progress(State::Typing, Mode::Command);
-        let n = last.text.chars().count();
-        self.executor.backspace(n).await?;
+        let typed = last.text.chars().count();
+        let verified = self.executor.verified_backspace(&last.text).await?;
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        Ok(Handled::Done(format!("took back {n} characters")))
+        Ok(Handled::Done(took_back(verified, typed)))
     }
 
     /// A spoken instruction about the last dictation: rewrite it with the
@@ -326,7 +346,9 @@ impl Router {
             return Ok(Handled::Done("nothing to change".into()));
         }
         self.progress(State::Typing, Mode::Command);
-        self.executor.backspace(last.text.chars().count()).await?;
+        let typed = last.text.chars().count();
+        let verified = self.executor.verified_backspace(&last.text).await?;
+        tracing::info!("edit: {}", took_back(verified, typed));
         self.executor.type_text(&text).await?;
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastDictation {
             text: text.clone(),
@@ -411,6 +433,17 @@ impl Router {
         tracing::info!("confirmed: {} ({})", pending.describe, pending.reason);
         self.progress(State::Typing, Mode::Command);
         self.executor.execute(command).await.map(Handled::Done)
+    }
+}
+
+/// What a verified deletion did, for the result line.
+fn took_back(verified: Verified, typed: usize) -> String {
+    match verified {
+        Verified::Exact => format!("took back {typed} characters (verified)"),
+        Verified::Fuzzy { deleted } => {
+            format!("took back {deleted} characters (verified; {typed} were typed)")
+        }
+        Verified::Blind => format!("took back {typed} characters (unverified)"),
     }
 }
 

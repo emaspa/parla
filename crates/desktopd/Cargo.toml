@@ -16,6 +16,10 @@ serde_json = "1"
 tokio = { workspace = true, features = ["sync"] }
 zbus = { workspace = true }
 fuzzy-matcher = { workspace = true }
+atspi-connection = { workspace = true }
+atspi-proxies = { workspace = true }
+atspi-common = { workspace = true }
+futures-lite = { workspace = true }
 reis = "0.7"
 xkbcommon = "0.9.0"
 libc = "0.2.189"

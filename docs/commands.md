@@ -31,7 +31,7 @@ The built-in rules, in priority order:
 | --- | --- | --- |
 | `yes`, `yes please`, `yeah`, `yep`, `confirm`, `do it`, `go ahead` | confirm | only meaningful while a prompt is up |
 | `no`, `nope`, `cancel`, `stop`, `never mind`, `nevermind` | deny | |
-| `scratch that`, `delete that`, `undo that`, `undo`, `erase that` | scratch_that | needs a recent dictation |
+| `scratch that`, `delete that`, `undo that`, `undo`, `erase that` | scratch_that | needs a recent dictation; checks the field still ends with it when the field can be read |
 | `open terminal`, `open konsole` | open_terminal | |
 | `start claude with {model}`, `start claude code with {model}`, `start claude code`, `start claude` | start_claude | |
 | `claude model {model}`, `switch claude to {model}`, `switch claude model to {model}`, `set claude model to {model}` | claude_model | a leading "claude" in the name is stripped |

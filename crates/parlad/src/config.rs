@@ -201,6 +201,10 @@ pub struct FlowConfig {
     /// How long after a dictation "scratch that" or "make that formal"
     /// still refer to it.
     pub edit_window_ms: u64,
+    /// Read the text around the cursor over AT-SPI at capture start and
+    /// tell the cleanup model what the dictation continues. Needs
+    /// `desktopd.a11y`; does nothing for a password field or the code tone.
+    pub context: bool,
     pub openai: OpenAiConfig,
 }
 
@@ -241,6 +245,7 @@ impl Default for FlowConfig {
             max_tokens: 1_024,
             history: true,
             edit_window_ms: 90_000,
+            context: true,
             openai: OpenAiConfig::default(),
         }
     }

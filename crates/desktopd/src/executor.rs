@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::task::spawn_blocking;
 
+use crate::a11y::{self, A11y, FocusedText};
 use crate::command::{AppTarget, Command, WindowTarget};
 use crate::config::DesktopdConfig;
 use crate::desktop::{DesktopEntry, DesktopIndex};
@@ -96,11 +97,35 @@ pub struct DesktopState {
     pub focused: Option<Window>,
 }
 
+/// How [`Executor::verified_backspace`] found the text it deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verified {
+    /// No focused text field could be read; as many characters as were
+    /// typed were deleted, unchecked.
+    Blind,
+    /// The field ended with exactly the text; that many characters deleted.
+    Exact,
+    /// The field ended with something close to the text (an application
+    /// changed it); `deleted` characters covered it.
+    Fuzzy { deleted: usize },
+}
+
+impl Verified {
+    /// Characters deleted, given how many were typed.
+    pub fn deleted(self, typed: usize) -> usize {
+        match self {
+            Verified::Blind | Verified::Exact => typed,
+            Verified::Fuzzy { deleted } => deleted,
+        }
+    }
+}
+
 pub struct Executor {
     cfg: DesktopdConfig,
     injector: Arc<dyn TextInjector>,
     windows: WindowCtl,
     index: DesktopIndex,
+    a11y: Option<Arc<A11y>>,
 }
 
 impl Executor {
@@ -116,11 +141,37 @@ impl Executor {
             injector,
             windows: WindowCtl::new(),
             index,
+            a11y: None,
         })
+    }
+
+    /// Read the focused text field through this connection; None keeps
+    /// the executor blind to it.
+    pub fn with_a11y(mut self, a11y: Option<Arc<A11y>>) -> Self {
+        self.a11y = a11y;
+        self
+    }
+
+    pub fn a11y(&self) -> Option<&Arc<A11y>> {
+        self.a11y.as_ref()
     }
 
     pub fn injector_name(&self) -> &'static str {
         self.injector.name()
+    }
+
+    /// The focused text field and the text around its caret, or None when
+    /// there is no a11y connection or nothing with a Text interface has
+    /// focus. An unreadable field is None too, and logged.
+    pub async fn focused_text(&self) -> Option<FocusedText> {
+        let a11y = self.a11y.as_ref()?;
+        match a11y.focused_text().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!("focused text unavailable: {e:#}");
+                None
+            }
+        }
     }
 
     pub fn tmux(&self) -> TmuxCtl {
@@ -408,6 +459,51 @@ impl Executor {
         .await
         .map_err(|e| anyhow::anyhow!("injection task panicked: {e}"))??;
         Ok(())
+    }
+
+    /// Delete `expected`, which parla typed a moment ago, from before the
+    /// caret, after checking it is still there. Without a readable text
+    /// field this is [`Executor::backspace`] with the typed length. When
+    /// the field ends with the text, or with something close to it (an
+    /// application autocorrected a word), that many characters go. When it
+    /// ends with something else, nothing is deleted and the error says so.
+    pub async fn verified_backspace(&self, expected: &str) -> anyhow::Result<Verified> {
+        let typed = expected.chars().count();
+        if typed == 0 {
+            return Ok(Verified::Exact);
+        }
+        let Some(field) = self.focused_text().await else {
+            self.backspace(typed).await?;
+            return Ok(Verified::Blind);
+        };
+        if field.password {
+            // Nothing can be read back from a password field.
+            self.backspace(typed).await?;
+            return Ok(Verified::Blind);
+        }
+        // The default window is shorter than a long dictation; read as far
+        // back as a fuzzy match could reach.
+        let need = (typed + typed * 3 / 10 + 1) as i32;
+        let before = if field.before.chars().count() < need as usize && field.caret > field.before.chars().count() as i32 {
+            field.handle.read(field.caret - need, field.caret).await?
+        } else {
+            field.before
+        };
+        match a11y::match_suffix(&before, expected) {
+            Some(a11y::SuffixMatch::Exact(n)) => {
+                self.backspace(n).await?;
+                Ok(Verified::Exact)
+            }
+            Some(a11y::SuffixMatch::Fuzzy(n)) => {
+                tracing::info!(
+                    "the dictated text changed in {}: deleting {n} characters for {typed} typed",
+                    field.app
+                );
+                self.backspace(n).await?;
+                Ok(Verified::Fuzzy { deleted: n })
+            }
+            None => anyhow::bail!("the text has changed since it was dictated"),
+        }
     }
 
     /// Send a key chord ("ctrl+s", "enter") to the focused window.

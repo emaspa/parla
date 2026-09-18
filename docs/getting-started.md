@@ -85,7 +85,8 @@ resolves the model paths, loads the VAD model and says which gate is active,
 parses the dictionary, snippets and app profiles,
 parses both hotkey chords, lists input devices, probes the injectors and
 says which one is active, counts visible windows and virtual desktops,
-resolves one `.desktop` lookup, reports whether the session is locked and
+resolves one `.desktop` lookup, reports whether the session is locked,
+whether the accessibility bus is reachable and its `IsEnabled` flag, and
 whether a daemon already owns the bus name. It registers no hotkeys, loads
 no model beyond the small VAD and types nothing, so it is safe on a live
 session.
@@ -186,6 +187,17 @@ default timeout; raise it or use the GPU.
 
 **CUDA out of memory.** Something else has the GPU. Lower
 `local.gpu_layers` to offload part of the model, or use a smaller GGUF.
+
+**Cleanup ignores the text around the cursor, or "scratch that" says
+"(unverified)".** The application has no AT-SPI bridge, or had not loaded
+it. Focus the field and run `parla-probe context` from another window: it
+prints the application, the field's role and the text before and after
+the cursor, or "no focused text field". Qt, GTK, Firefox, Chromium and
+Electron load their bridge only once `org.a11y.Status.IsEnabled` is set,
+which parlad does at startup. Qt applications pick the change up while
+running; an application that still shows nothing needs to be started after
+the flag was set. `--check` shows whether the bus is reachable, and
+`RUST_LOG=desktopd=debug` logs each focused text object as it changes.
 
 **A command is refused as "unclear" that should have worked.** Run
 `parlad --judge "<what you said>"` with `RUST_LOG=parlad=debug` to see the

@@ -46,13 +46,14 @@ kglobalaccel ── pressed ──▶ capture thread (cpal) ──▶ samples
    the release signal is what makes hold-to-talk work without reading input
    devices. A daemon whose signal stream closes is deaf, so that is fatal and
    a supervisor should restart it.
-2. **Capture.** At the press, the focused window is looked up in parallel
-   with opening the microphone, so the window that gets the text is the one
-   that had focus when the user started speaking, not when the model
-   finished. The cpal stream lives on its own thread because opening a
-   PipeWire device can block and the stream handle is not `Send`. The
-   callback downmixes to mono, resamples to 16 kHz, and computes an RMS
-   level every 40 ms for the bus.
+2. **Capture.** At the press, the focused window and the focused text
+   field are looked up in parallel with opening the microphone, so the
+   window that gets the text is the one that had focus when the user
+   started speaking, not when the model finished, and the text around the
+   cursor is what was there before anything was said. The cpal stream lives
+   on its own thread because opening a PipeWire device can block and the
+   stream handle is not `Send`. The callback downmixes to mono, resamples
+   to 16 kHz, and computes an RMS level every 40 ms for the bus.
 3. **Gate.** At the release, the capture is cut to where speech is, on the
    blocking thread whisper uses. With the Silero model at
    `asr.vad_model_path`, whisper.cpp's frame-level VAD returns speech
@@ -100,6 +101,13 @@ The daemon is a tokio runtime with a few dedicated threads around it:
   and publishing state from a watch channel, so the main loop never waits
   on a client.
 - A **lock watcher** follows `org.freedesktop.ScreenSaver`.
+- The **a11y follower** is a task on a second zbus connection, to the
+  accessibility bus. It keeps the most recently focused object that has a
+  Text interface, from `object:state-changed:focused` and
+  `object:text-caret-moved` events, and a capture reads that object's
+  text with calls bounded to 300 ms each. At startup, and whenever the
+  kept object is no longer focused, the active windows are walked for the
+  focused object, at most 400 objects and 1.5 s.
 
 ## The local model
 
@@ -130,8 +138,9 @@ With `judge.backend = "typesafe"`, each judged command sends the utterance,
 the installed application names, and each open window's class and index.
 Titles go only with `judge.send_window_titles = true`. With
 `flow.backend = "openai"`, each dictation sends the transcript, the
-profile's instructions and the dictionary's words. The two switches are
-independent.
+profile's instructions, the dictionary's words and, with `flow.context`
+on, up to 300 characters of the text before the cursor in the focused
+field. The two switches are independent.
 
 ## Safety rails
 
@@ -158,6 +167,10 @@ microphone can speak a command. The rails are built around that.
 - **Cleanup output is checked.** Empty or runaway model output is replaced
   by the raw transcript, so the model can fail to help but cannot type
   something the user did not say.
+- **Deletions are checked.** "Scratch that" and a spoken edit read the
+  focused field first and delete only what is still there; a field that no
+  longer ends with the dictation is left alone. A password field is never
+  read.
 - **Secrets stay out of logs.** API keys are a type whose `Debug` and
   serialisation print `<redacted>`.
 
@@ -169,6 +182,7 @@ microphone can speak a command. The rails are built around that.
 | typing and key chords | KWin's EIS interface over libei (the `reis` crate), falling back to `ydotoold`'s socket |
 | windows | `kdotool`, which runs KWin scripts over D-Bus; ids are KWin UUIDs |
 | focused window | the same, resolved at capture start |
+| focused text | AT-SPI over the a11y bus (the `atspi-connection`, `atspi-proxies` and `atspi-common` crates), read at capture start and before a deletion |
 | launching | `kioclient exec applications:<id>`, then `gtk-launch`, then `systemd-run --user` with the parsed Exec line |
 | installed apps | a `.desktop` index over the XDG application directories with fuzzy lookup |
 | virtual desktops, KRunner | KWin's `VirtualDesktopManager` and KRunner D-Bus interfaces |
@@ -180,7 +194,8 @@ microphone can speak a command. The rails are built around that.
 | audio cues | `pw-play` or `paplay` with the wav files in `crates/parlad/assets/cues` |
 
 One session bus connection is shared across the crate; zbus connections
-are cheap to clone and expensive to open.
+are cheap to clone and expensive to open. The accessibility bus is a
+separate bus with its own connection, opened once at startup.
 
 ## Logging
 
@@ -204,5 +219,8 @@ matching and output checks, the history file, the config, and the bus
 interface end to end over a private session bus with a unique name. None
 of them need a GPU, a microphone or a Plasma session. The things that do
 have read-only CLI entry points instead: `parlad --check`, `--judge`,
-`--flow`, `--edit` and `parla-probe snapshot` all run against the live
-desktop without registering hotkeys or typing anything.
+`--flow`, `--edit`, `parla-probe snapshot` and `parla-probe context` all
+run against the live desktop without registering hotkeys or typing
+anything. The suffix matcher behind verified deletions, the leading-space
+rule and the prompt's context section are unit tests; the a11y connection
+itself is only exercised through the probe.

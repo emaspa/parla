@@ -47,9 +47,9 @@ dictionary fixes the names whisper gets wrong and primes it for next time,
 and the cleanup model rewrites the rest: fillers and false starts go, a
 self-correction keeps its final version ("send it Monday, no, Tuesday"
 becomes "send it Tuesday"), spoken punctuation becomes punctuation, and an
-enumeration becomes a list. The model is told never to add, answer or
-translate, and its output is checked. Anything empty or suspiciously long
-is replaced by the raw transcript.
+enumeration becomes a list. The prompt forbids adding, answering or
+translating, and parla checks what comes back. If it is empty or
+suspiciously long, the raw transcript is typed instead.
 
 How the text should read depends on where it lands. A profile per window
 class picks a tone: `code` for terminals and editors turns "dash" into `-`
@@ -80,8 +80,8 @@ what the model answered, and whether the policy would act, ask or refuse.
 The judge sends one request with the utterance and the state code already
 knows: which applications are installed, which windows are open, how many
 desktops exist. Candidates come from that state, so the model cannot name
-a target that does not exist. Whether something already runs is read from
-the window list rather than asked. A message for Claude Code is copied
+a target that does not exist. Whether something already runs comes from
+the window list, not from the model. A message for Claude Code is copied
 from the utterance, never rewritten.
 
 The local model never generates text for the judge. Every question has a
@@ -92,6 +92,10 @@ instead, with window titles kept on this machine unless allowed.
 
 ## The UI
 
+![The overlay pill while parla listens](docs/img/overlay-listening.png)
+
+![The home page: state, hotkeys, models, statistics and recent utterances](docs/img/home.png)
+
 `parla-ui` is a Qt Quick and Kirigami application over the session bus.
 An overlay pill at the bottom of the screen shows the microphone level
 while parla listens, then the result or the confirmation question. A tray
@@ -101,6 +105,7 @@ box, and settings. The daemon runs without it.
 
 `parla-mockd` is a stand-in daemon that serves the same bus interface with
 made-up state, so the UI can be worked on without a microphone or a model.
+The screenshots above come from it.
 
 ## Getting it running
 
@@ -158,7 +163,7 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
   the meantime, with autocorrect or autocomplete, is left with a mess.
 - **Cleanup does not see the screen.** Wispr Flow reads the text around
   the cursor to match its style; parla knows only the window class.
-- **The dictionary does not learn.** A correction you type by hand after a
+- **The dictionary does not learn.** A correction you type after a
   dictation is not noticed. Names go into the dictionary by hand.
 - **The daemon and the UI have run together only against the mock.** The
   bus contract is tested end to end, but the first real session with both

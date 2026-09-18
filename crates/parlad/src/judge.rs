@@ -3,31 +3,37 @@
 //! `Grammar::parse` matches literal word sequences, so it answers in
 //! microseconds and misses anything phrased differently ("bring up firefox",
 //! "kill that window"). Rather than hand those to a conversational agent, this
-//! asks the model for the intent *and* every argument that intent might need
-//! in one evaluation — the questions are independent, so asking for
-//! arguments we will discard costs only their tokens. Which model answers is
-//! the [`Oracle`]'s business: a GGUF on this machine's GPU by default, or
-//! the TypeSafe API.
+//! asks the model which intent was meant (and whether anything was meant at
+//! all), then only the questions that intent still needs: a target, a
+//! desktop, a model name, or a message when no cue rule found it. Which
+//! model answers is the [`Oracle`]'s business: a GGUF on this machine's GPU
+//! by default, or the TypeSafe API.
 //!
 //! Code still owns everything code is good at: which apps are installed, which
-//! windows are open, how many desktops exist, and what counts as confident
-//! enough to act. The model only supplies the semantic step — which of the
-//! candidates the user meant. Every candidate is offered under an opaque key
-//! (`a:3`, `w:0`, `p:2`) with the human-readable value in its description, so
-//! a window titled `__none__` can never be mistaken for the no-match option,
-//! and every returned choice is checked against what was offered.
+//! windows are open, how many desktops exist, what a "remind me to" or "hit
+//! control s" carries, which intents can destroy work, and what counts as
+//! confident enough to act. The model only supplies the semantic step — which
+//! of the candidates the user meant. Every candidate is offered under an
+//! opaque key (`a:3`, `w:0`, `p:2`) with the human-readable value in its
+//! description, so a window titled `__none__` can never be mistaken for the
+//! no-match option, and every returned choice is checked against what was
+//! offered.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use desktopd::DesktopIndex;
+use parla_grammar::chord::spoken_chord;
 use parla_grammar::Intent;
 use serde_json::json;
 
 use crate::config::{Backend, JudgeConfig};
 use crate::local::LocalModel;
-use crate::oracle::{Answer, NoulCriteria, Oracle, Question, Response, MAX_CHOICE_OPTIONS};
-use crate::policy::{Policy, Signals};
+use crate::oracle::{
+    Answer, Criteria, NoulCriteria, Oracle, Question, Response, MAX_CHOICE_OPTIONS,
+};
+use crate::payload::strip_cue;
+use crate::policy::{risk_rule, Policy, Risk, Signals};
 use crate::typesafe::Client;
 use desktopd::windows::Window;
 
@@ -35,6 +41,13 @@ use desktopd::windows::Window;
 /// cannot collide with anything observed.
 const NO_TARGET: &str = "__none__";
 const FOCUSED: &str = "__focused_window__";
+/// The whole utterance as a payload, offered last: the answer only when no
+/// part of it is a command wrapper.
+const WHOLE: &str = "__whole__";
+/// The three readings of an utterance the dictation question offers.
+const DICTATION_COMMAND: &str = "command";
+const DICTATION_TEXT: &str = "text";
+const DICTATION_NEITHER: &str = "neither";
 
 /// Opaque key prefixes for observed candidates.
 const APP_KEY: &str = "a:";
@@ -102,7 +115,8 @@ pub struct Detailed {
     pub verdict: Verdict,
     /// Probability of yes to `is_dictation`, before any threshold.
     pub dictation: Option<f64>,
-    /// Probability of yes to `is_destructive`, before any threshold.
+    /// Probability of yes to `is_destructive`, before any threshold; None
+    /// when the intent's risk was decided by rule and the model not asked.
     pub destructive: Option<f64>,
     /// The intent key the model ranked first and its probability, whatever
     /// became of it; the no-match sentinel when it chose that.
@@ -184,8 +198,24 @@ impl Judge {
         let candidates = Candidates::build(utterance, ctx, self.send_window_titles);
         let state = candidates.state(utterance, ctx);
 
+        // Two rounds: the intent (and whether this was prose at all) first,
+        // then only the questions that intent needs. A message the cue
+        // rules already found and a risk the intent itself decides are
+        // never asked. The state is shared through the cache locally, so
+        // the second round costs its own questions and nothing more.
         let t0 = std::time::Instant::now();
-        let resp = self.oracle.evaluate(&state, &candidates.questions).await?;
+        let mut resp = self.oracle.evaluate(&state, &candidates.first_round()).await?;
+        if let Some((intent, _)) = resp.choice("intent") {
+            let second = candidates.second_round(intent);
+            if !second.is_empty() {
+                let more = self.oracle.evaluate(&state, &second).await?;
+                resp.answers.extend(more.answers);
+                if let (Some(u), Some(m)) = (resp.usage.as_mut(), more.usage) {
+                    u.input_tokens += m.input_tokens;
+                    u.output_tokens += m.output_tokens;
+                }
+            }
+        }
         let (tokens_in, tokens_out) = resp
             .usage
             .as_ref()
@@ -201,7 +231,7 @@ impl Judge {
 
         Ok(Detailed {
             verdict: compose(&resp, &candidates),
-            dictation: resp.noul("is_dictation"),
+            dictation: dictation_probability(&resp),
             destructive: resp.noul("is_destructive"),
             intent: resp.choice("intent").map(|(k, p)| (k.to_string(), p)),
         })
@@ -219,9 +249,19 @@ fn compose(resp: &Response, cand: &Candidates) -> Verdict {
     }
 }
 
+/// The probability that the utterance was text to type: the weight the
+/// dictation question put on its "text" reading. None when the question
+/// was not answered as a choice, or the reading was not among the options
+/// answered, so the policy asks rather than assumes.
+fn dictation_probability(resp: &Response) -> Option<f64> {
+    match resp.answers.get("is_dictation") {
+        Some(Answer::Choice { probabilities, .. }) => probabilities.get(DICTATION_TEXT).copied(),
+        _ => None,
+    }
+}
+
 fn build(resp: &Response, cand: &Candidates) -> Result<Verdict, String> {
-    let dictation = resp.noul("is_dictation");
-    let destructive = resp.noul("is_destructive");
+    let dictation = dictation_probability(resp);
 
     let (name, intent_conf) = match cand.pick(resp, "intent")? {
         Pick::Chosen(n, c) => (n, c),
@@ -247,6 +287,19 @@ fn build(resp: &Response, cand: &Candidates) -> Result<Verdict, String> {
         cand.arg(resp, id, confidence)?
             .ok_or_else(|| format!("{name} without a {id}"))
     }
+
+    // The message an intent passes on: by rule when a cue phrase starts
+    // the utterance, otherwise the span the model picked. A rule's answer
+    // was never in doubt, so it leaves the confidence alone.
+    let payload = |resp: &Response, confidence: &mut f64| -> Result<String, String> {
+        match strip_cue(name, &cand.utterance) {
+            Some(text) => Ok(text),
+            None => {
+                let key = required(cand, resp, name, "payload", confidence)?;
+                Ok(cand.span(key)?.to_string())
+            }
+        }
+    };
 
     match name {
         "show_app" => {
@@ -286,8 +339,7 @@ fn build(resp: &Response, cand: &Candidates) -> Result<Verdict, String> {
             }
         }
         "krunner" => {
-            let key = required(cand, resp, name, "payload", &mut confidence)?;
-            args.insert("query".into(), cand.span(key)?.to_string());
+            args.insert("query".into(), payload(resp, &mut confidence)?);
         }
         "virtual_desktop" => {
             let key = required(cand, resp, name, "desktop_number", &mut confidence)?;
@@ -321,12 +373,16 @@ fn build(resp: &Response, cand: &Candidates) -> Result<Verdict, String> {
             args.insert("model".into(), m.to_string());
         }
         "claude_tell" | "notify" => {
-            let key = required(cand, resp, name, "payload", &mut confidence)?;
-            args.insert("text".into(), cand.span(key)?.to_string());
+            args.insert("text".into(), payload(resp, &mut confidence)?);
         }
         "key" => {
-            let key = required(cand, resp, name, "payload", &mut confidence)?;
-            args.insert("chord".into(), cand.span(key)?.replace(" plus ", " "));
+            // Spoken words become key names, or the intent is unclear: a
+            // chord is injected into whatever has focus, so a word that is
+            // not a key must not become a guess.
+            let spoken = payload(resp, &mut confidence)?;
+            let chord = spoken_chord(&spoken)
+                .ok_or_else(|| format!("{spoken:?} is not a key chord"))?;
+            args.insert("chord".into(), chord);
         }
         "edit_text" => {
             // The whole utterance is the instruction; the model that
@@ -339,6 +395,15 @@ fn build(resp: &Response, cand: &Candidates) -> Result<Verdict, String> {
 
     let intent = Intent::from_args(build_name, &args)
         .ok_or_else(|| format!("could not build {build_name} from {args:?}"))?;
+
+    // Risk is the intent's own where the intent decides it. Only an
+    // intent the rule leaves to the model carries the model's answer, and
+    // for one that always confirms the policy asks before it would look.
+    let destructive = match risk_rule(name) {
+        Risk::Never => Some(0.0),
+        Risk::AlwaysConfirmed => None,
+        Risk::Judged => resp.noul("is_destructive"),
+    };
 
     Ok(Verdict::Act(Resolved {
         intent,
@@ -388,10 +453,14 @@ struct Candidates {
     apps: Vec<AppCandidate>,
     /// Open windows, keyed `w:<index>`.
     windows: Vec<Window>,
-    /// Trailing spans of the utterance, keyed `p:<index>`.
+    /// Trailing spans of the utterance, keyed `p:<index>` by the word
+    /// they start at. Index 0, the whole utterance, is offered as
+    /// [`WHOLE`] instead, last.
     spans: Vec<String>,
     desktop_count: u32,
     send_window_titles: bool,
+    /// Every question that may be asked, so an answer can be checked
+    /// against what was offered whichever round asked it.
     questions: BTreeMap<String, Question>,
 }
 
@@ -454,7 +523,9 @@ impl Candidates {
         send_window_titles: bool,
         last_dictation: bool,
     ) -> Self {
-        let mut targets: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        // The candidates, then the two ways of naming none of them: a
+        // "none of these" reads as one only after the list it rejects.
+        let mut targets = Criteria::new();
         for (i, app) in apps.iter().enumerate() {
             let desc = match &app.generic_name {
                 Some(g) => format!("installed application {} ({g})", app.name),
@@ -474,46 +545,37 @@ impl Candidates {
             targets.insert(format!("{WINDOW_KEY}{i}"), json!(desc));
         }
         targets.insert(
-            FOCUSED.into(),
-            json!("the window that currently has focus, because the user named no target"),
+            FOCUSED,
+            json!("the window the user is working in right now: what `this window`, `the current window` or a request that names no window means"),
         );
         targets.insert(
-            NO_TARGET.into(),
-            json!("the utterance names no application or window"),
+            NO_TARGET,
+            json!("none of these: the utterance names no application or window on this list"),
         );
 
-        let mut desktops: BTreeMap<String, serde_json::Value> = (1..=desktop_count
-            .min(DESKTOP_CANDIDATES))
-            .map(|n| (n.to_string(), json!(format!("virtual desktop number {n}"))))
-            .collect();
-        desktops.insert(
-            NO_TARGET.into(),
-            json!("no specific desktop number is named"),
-        );
-
-        let mut payload: BTreeMap<String, serde_json::Value> = spans
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (format!("{SPAN_KEY}{i}"), json!(s)))
-            .collect();
-        payload.insert(
-            NO_TARGET.into(),
-            json!("`utterance` carries no such message"),
-        );
-
-        let mut intents = intent_criteria();
-        if last_dictation {
-            intents.insert(
-                "edit_text".into(),
-                json!({
-                    "what": "Change the text the user dictated a moment ago: rewrite, shorten, expand, reformat, translate, fix, or change its tone",
-                    "examples": [
-                        "make that more formal", "shorter", "turn that into bullet points",
-                        "translate that to Italian", "capitalise the first word",
-                    ],
-                }),
-            );
+        let mut desktops = Criteria::new();
+        for n in 1..=desktop_count.min(DESKTOP_CANDIDATES) {
+            desktops.insert(n.to_string(), json!(format!("virtual desktop number {n}")));
         }
+        desktops.insert(NO_TARGET, json!("none of these: no desktop number is named, or the number named does not exist"));
+
+        // Spans from the second word on: the first word of a message that
+        // needed the model is a verb ("tell", "remind"), never the message.
+        // The whole utterance is the last resort and reads as one.
+        let mut payload = Criteria::new();
+        for (i, s) in spans.iter().enumerate().skip(1) {
+            payload.insert(format!("{SPAN_KEY}{i}"), json!(s));
+        }
+        payload.insert(NO_TARGET, json!("`utterance` carries no such message"));
+        payload.insert(
+            WHOLE,
+            json!(format!(
+                "all of `utterance`, {:?}: only if no word of it is a command wrapper",
+                spans.first().map(String::as_str).unwrap_or("")
+            )),
+        );
+
+        let intents = intent_criteria(last_dictation);
         let mut q = BTreeMap::new();
         q.insert(
             "intent".into(),
@@ -525,14 +587,27 @@ impl Candidates {
                 criteria: intents,
             },
         );
+        // Three ways, not two: prose against "a command" alone read every
+        // command that carries text (a reminder, a message for Claude Code)
+        // as text. Named beside a question or noise, prose is what it is.
         q.insert(
             "is_dictation".into(),
-            Question::Noul {
-                instructions: json!("Is `utterance` prose the user wants typed verbatim into the focused window, rather than an instruction for the desktop to carry out?"),
-                criteria: Some(NoulCriteria {
-                    yes: "Text to be transcribed as-is, such as a sentence of an email, a chat message, or a code comment.".into(),
-                    no: "An instruction to the desktop or to a tool: launching, focusing, closing, switching, searching, or telling Claude Code something.".into(),
-                }),
+            Question::Choice {
+                instructions: json!("What was `utterance`: a command for this desktop assistant, text the user meant to have typed as spoken, or neither?"),
+                criteria: Criteria::from([
+                    (
+                        DICTATION_COMMAND,
+                        json!("asks the assistant to do something on this desktop or in Claude Code, even when it carries words to pass on: a notification's text, a search, a message for Claude Code, a change to the text just dictated"),
+                    ),
+                    (
+                        DICTATION_TEXT,
+                        json!("a sentence for a document, email, chat or note, to be typed as spoken: a statement, a greeting, a remark or a request to another person; it asks nothing of this desktop"),
+                    ),
+                    (
+                        DICTATION_NEITHER,
+                        json!("a question for the assistant to answer, a fragment, or noise"),
+                    ),
+                ]),
             },
         );
         q.insert(
@@ -553,7 +628,7 @@ impl Candidates {
             Question::Choice {
                 instructions: json!({
                     "task": "Assuming `utterance` acts on an application or window, which candidate did the user mean?",
-                    "note": "Candidates are the applications installed on this machine and the windows currently open (the `w:` keys match `open_windows`). Choose the open window when the user implies something already running.",
+                    "note": "`a:` keys are applications installed on this machine, named with what they do; `w:` keys are the windows currently open, matching `open_windows`. An application asked for by name or by what it does is a match even if no window of it is open. Choose the open window when the user implies something already running.",
                 }),
                 criteria: targets,
             },
@@ -569,10 +644,10 @@ impl Candidates {
             "desktop_direction".into(),
             Question::Choice {
                 instructions: json!("Assuming `utterance` asks to move one virtual desktop relative to the current one, in which direction?"),
-                criteria: BTreeMap::from([
-                    ("next".into(), json!("forward, to a higher-numbered desktop")),
-                    ("previous".into(), json!("back, to a lower-numbered desktop")),
-                    (NO_TARGET.into(), json!("no relative movement is asked for")),
+                criteria: Criteria::from([
+                    ("next", json!("forward, to a higher-numbered desktop: the next or following one, to the right")),
+                    ("previous", json!("back, to a lower-numbered desktop: the previous one, to the left")),
+                    (NO_TARGET, json!("neither: no relative movement is asked for")),
                 ]),
             },
         );
@@ -580,11 +655,11 @@ impl Candidates {
             "claude_model".into(),
             Question::Choice {
                 instructions: json!("Assuming `utterance` names which Claude model to use, which one? Choose the no-name option if the user does not mention a model at all, so the configured default stands."),
-                criteria: BTreeMap::from([
-                    ("opus".into(), json!("the most capable model; also 'the big one', 'the smart one'")),
-                    ("sonnet".into(), json!("the balanced default")),
-                    ("haiku".into(), json!("the smallest and fastest; also 'the quick one', 'the cheap one'")),
-                    (NO_TARGET.into(), json!("no model is named or implied")),
+                criteria: Criteria::from([
+                    ("opus", json!("the most capable model; also 'the big one', 'the smart one'")),
+                    ("sonnet", json!("the balanced default")),
+                    ("haiku", json!("the smallest and fastest; also 'the quick one', 'the small one', 'the cheap one'")),
+                    (NO_TARGET, json!("none of these: no model is named or implied")),
                 ]),
             },
         );
@@ -744,79 +819,183 @@ impl Candidates {
     }
 
     fn span(&self, key: &str) -> Result<&str, String> {
+        if key == WHOLE {
+            return Ok(&self.utterance);
+        }
         indexed(key, SPAN_KEY)
             .and_then(|i| self.spans.get(i))
             .map(String::as_str)
             .ok_or_else(|| format!("payload key {key:?} names no span"))
     }
+
+    /// The questions every utterance gets: what was asked for, and whether
+    /// anything was asked for at all.
+    fn first_round(&self) -> BTreeMap<String, Question> {
+        self.round(["intent", "is_dictation"])
+    }
+
+    /// The questions the chosen intent still needs. A message a cue rule
+    /// found, and a risk the intent decides, are not among them. Empty for
+    /// an intent that needs nothing more, and for no intent.
+    fn second_round(&self, intent: &str) -> BTreeMap<String, Question> {
+        if intent == NO_TARGET {
+            return BTreeMap::new();
+        }
+        let mut ids: Vec<&str> = Vec::new();
+        match intent {
+            "show_app" | "close_window" | "minimize_window" | "maximize_window" => {
+                ids.push("target");
+            }
+            "virtual_desktop" => ids.push("desktop_number"),
+            "virtual_desktop_rel" => ids.push("desktop_direction"),
+            "start_claude" | "claude_model" => ids.push("claude_model"),
+            "krunner" | "notify" | "claude_tell" | "key"
+                if strip_cue(intent, &self.utterance).is_none() =>
+            {
+                ids.push("payload");
+            }
+            _ => {}
+        }
+        if risk_rule(intent) == Risk::Judged {
+            ids.push("is_destructive");
+        }
+        let mut q = self.round(ids);
+        if let Some(Question::Choice { instructions, .. }) = q.get_mut("payload") {
+            *instructions = payload_instructions(intent);
+        }
+        q
+    }
+
+    fn round<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, Question> {
+        ids.into_iter()
+            .filter_map(|id| Some((id.to_string(), self.questions.get(id)?.clone())))
+            .collect()
+    }
 }
 
-fn intent_criteria() -> BTreeMap<String, serde_json::Value> {
-    BTreeMap::from([
+/// The payload question worded for the intent it serves, since by the
+/// second round the intent is known.
+fn payload_instructions(intent: &str) -> serde_json::Value {
+    let (what, example) = match intent {
+        "notify" => (
+            "the text of a desktop notification the user asked to be shown",
+            "For 'pop up a note saying lunch is ready', the message is 'lunch is ready'.",
+        ),
+        "krunner" => (
+            "the search terms the user asked to be looked up",
+            "For 'can you look for the vacation photos', the message is 'the vacation photos'.",
+        ),
+        "key" => (
+            "the key chord the user asked to be pressed",
+            "For 'hit control s', the message is 'control s'.",
+        ),
+        _ => (
+            "the instruction the user wants passed to Claude Code as spoken",
+            "For 'let claude know the tests pass', the message is 'the tests pass'.",
+        ),
+    };
+    json!({
+        "task": format!("`utterance` carries a message to pass on verbatim: {what}. Which candidate is exactly that message?"),
+        "focus": "Each candidate is a trailing span of `utterance`. Pick the one that starts right after the words that ask for the action, keeping the message itself complete. The whole utterance is the answer only when it contains no such words.",
+        "example": example,
+    })
+}
+
+/// The intents on offer, in the order the model reads them: the refusal
+/// first, then the actions by name, `edit_text` among them only while a
+/// dictation is fresh. The order is deliberate and measured
+/// (docs/commands.md): with the refusal last, as the target question has
+/// it, three more corpus cases went to a wrong intent and one more wrong
+/// act went unconfirmed.
+fn intent_criteria(last_dictation: bool) -> Criteria {
+    let mut intents = Criteria::new();
+    intents.insert(
+        NO_TARGET,
+        json!("Not a desktop command, or too ambiguous to act on safely"),
+    );
+    let actions = [
         // Launch-vs-focus is deliberately absent: whether the target already
         // runs is an observed fact, so code decides it and the model's
         // probability is not split between two spellings of one wish.
         (
-            "show_app".into(),
+            "claude_model",
+            json!("Change which model the running Claude Code session uses"),
+        ),
+        (
+            "claude_read",
+            json!("Read back what the Claude Code session has output so far, or report what it is doing now"),
+        ),
+        (
+            "claude_tell",
+            json!("Send the running Claude Code session an instruction, question or message to act on: have it fix, explain, add or run something"),
+        ),
+        (
+            "close_window",
+            json!("Close or quit a window"),
+        ),
+        (
+            "edit_text",
             json!({
-                "what": "Put an application or window in front of the user, whether or not it is already running",
+                "what": "Change the text the user dictated a moment ago: rewrite, shorten, expand, reformat, translate, fix, or change its tone",
                 "examples": [
-                    "open firefox", "bring up my editor",
+                    "make that more formal", "shorter", "turn that into bullet points",
+                    "translate that to Italian", "capitalise the first word",
+                ],
+            }),
+        ),
+        (
+            "key",
+            json!("Press a key or key chord in the focused window: enter, escape, tab, control s, alt f4"),
+        ),
+        (
+            "krunner",
+            json!("Search this computer for a file, folder or document by name: find, look up, locate, where is. Not for starting a program"),
+        ),
+        (
+            "maximize_window",
+            json!("Maximize or full-screen a window"),
+        ),
+        (
+            "minimize_window",
+            json!("Hide a window from the screen without closing it: minimize, tuck away, send to the taskbar"),
+        ),
+        (
+            "notify",
+            json!("Show the user a desktop notification with the text they give"),
+        ),
+        (
+            "open_terminal",
+            json!("Open a new terminal window: a shell, a console"),
+        ),
+        (
+            "show_app",
+            json!({
+                "what": "Put an application or window in front of the user, whether or not it is already running. The application may be named by what it does: the file manager, the calculator, the screenshot tool",
+                "examples": [
+                    "open firefox", "bring up my editor", "run the calculator",
                     "switch to the browser", "I need a terminal window",
                 ],
             }),
         ),
-        ("close_window".into(), json!("Close or quit a window")),
-        ("minimize_window".into(), json!("Minimize or hide a window")),
         (
-            "maximize_window".into(),
-            json!("Maximize or full-screen a window"),
+            "start_claude",
+            json!("Start a new Claude Code coding session, optionally naming its model"),
         ),
         (
-            "virtual_desktop".into(),
+            "virtual_desktop",
             json!("Switch to a virtual desktop identified by number"),
         ),
         (
-            "virtual_desktop_rel".into(),
+            "virtual_desktop_rel",
             json!("Move one virtual desktop forward or back from the current one"),
         ),
-        (
-            "open_terminal".into(),
-            json!("Open a terminal emulator, with no particular program named"),
-        ),
-        (
-            "start_claude".into(),
-            json!("Start a Claude Code coding session"),
-        ),
-        (
-            "claude_model".into(),
-            json!("Change which model the running Claude Code session uses"),
-        ),
-        (
-            "claude_tell".into(),
-            json!("Pass an instruction or prompt through to the running Claude Code session"),
-        ),
-        (
-            "claude_read".into(),
-            json!("Read back what the Claude Code session most recently output"),
-        ),
-        (
-            "krunner".into(),
-            json!("Search the system for a file or application by name"),
-        ),
-        (
-            "notify".into(),
-            json!("Show the user a desktop notification"),
-        ),
-        (
-            "key".into(),
-            json!("Send a raw keyboard chord to whatever window has focus"),
-        ),
-        (
-            NO_TARGET.into(),
-            json!("Not a desktop command, or too ambiguous to act on safely"),
-        ),
-    ])
+    ];
+    for (name, desc) in actions {
+        if name != "edit_text" || last_dictation {
+            intents.insert(name, desc);
+        }
+    }
+    intents
 }
 
 #[cfg(test)]
@@ -845,6 +1024,21 @@ mod tests {
 
     fn noul(p: f64) -> serde_json::Value {
         serde_json::json!({ "type": "noul", "noul": p })
+    }
+
+    /// The dictation question answered with `p` on its "text" reading.
+    fn dictation(p: f64) -> serde_json::Value {
+        let (choice, conf) = if p >= 0.5 {
+            (DICTATION_TEXT, p)
+        } else {
+            (DICTATION_COMMAND, 1.0 - p)
+        };
+        serde_json::json!({
+            "type": "choice",
+            "choice": choice,
+            "confidence": conf,
+            "probabilities": { DICTATION_TEXT: p, DICTATION_COMMAND: 1.0 - p },
+        })
     }
 
     fn window(id: &str, title: &str, class: &str) -> Window {
@@ -924,7 +1118,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.94),
             "target": choice("a:0", 0.99),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.03),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -946,7 +1140,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.95),
             "target": choice("a:1", 0.50),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.01),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -961,7 +1155,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("start_claude", 0.99),
             "claude_model": choice(NO_TARGET, 0.50),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.02),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -972,7 +1166,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("start_claude", 0.99),
             "claude_model": choice(NO_TARGET, 0.20),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.02),
         }));
         assert!(refused(compose(&r, &cand())).contains("0.20"));
@@ -986,7 +1180,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.99),
             "target": choice("a:0", 0.99),
-            "is_dictation": noul(0.88),
+            "is_dictation": dictation(0.88),
             "is_destructive": noul(0.01),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -1001,7 +1195,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("close_window", 1.0),
             "target": choice("w:0", 1.0),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.91),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -1017,21 +1211,21 @@ mod tests {
 
     #[test]
     fn missing_safety_answers_force_confirmation() {
-        // No is_destructive answer is not "safe": a harmless-looking
-        // minimize must still ask.
+        // No is_destructive answer is not "safe" for an intent whose risk
+        // is the model's to judge: a search with no answer must still ask.
+        let c = cand_with(&[], &[], 1, "look for the invoice");
         let r = resp(serde_json::json!({
-            "intent": choice("minimize_window", 0.95),
-            "target": choice(FOCUSED, 0.95),
-            "is_dictation": noul(0.01),
+            "intent": choice("krunner", 0.95),
+            "is_dictation": dictation(0.01),
         }));
-        let (_, decision) = act(compose(&r, &cand()));
+        let (_, decision) = act(compose(&r, &c));
         assert!(matches!(decision, Decision::Confirm { .. }));
 
         // Likewise a missing (or wrong-typed) is_dictation answer.
         let r = resp(serde_json::json!({
             "intent": choice("minimize_window", 0.95),
             "target": choice(FOCUSED, 0.95),
-            "is_dictation": choice("yes", 0.9),
+            "is_dictation": noul(0.1),
             "is_destructive": noul(0.01),
         }));
         let (_, decision) = act(compose(&r, &cand()));
@@ -1045,7 +1239,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("minimize_window", 0.92),
             "target": choice(FOCUSED, 0.95),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.04),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -1059,14 +1253,14 @@ mod tests {
         let none = resp(serde_json::json!({
             "intent": choice("minimize_window", 0.92),
             "target": choice(NO_TARGET, 0.95),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.04),
         }));
         assert!(unclear(compose(&none, &cand())).contains("without a target"));
 
         let missing = resp(serde_json::json!({
             "intent": choice("close_window", 0.92),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.04),
         }));
         assert!(unclear(compose(&missing, &cand())).contains("without a target"));
@@ -1077,7 +1271,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.9),
             "target": choice(FOCUSED, 0.9),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.01),
         }));
         unclear(compose(&r, &cand()));
@@ -1087,7 +1281,7 @@ mod tests {
     fn no_match_and_low_confidence_both_refuse() {
         let none = resp(serde_json::json!({
             "intent": choice(NO_TARGET, 0.9),
-            "is_dictation": noul(0.1),
+            "is_dictation": dictation(0.1),
         }));
         unclear(compose(&none, &cand()));
 
@@ -1096,7 +1290,7 @@ mod tests {
         let shaky = resp(serde_json::json!({
             "intent": choice("close_window", 0.20),
             "target": choice(FOCUSED, 0.9),
-            "is_dictation": noul(0.1),
+            "is_dictation": dictation(0.1),
             "is_destructive": noul(0.1),
         }));
         refused(compose(&shaky, &cand()));
@@ -1109,7 +1303,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop", 0.97),
             "desktop_number": choice(NO_TARGET, 0.99),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
         }));
         unclear(compose(&r, &cand()));
     }
@@ -1119,7 +1313,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop", 0.97),
             "desktop_number": choice("3", 0.99),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.01),
         }));
         // Two desktops were offered, so "3" was never a candidate.
@@ -1128,7 +1322,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop", 0.97),
             "desktop_number": choice("2", 0.99),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.01),
         }));
         let (got, _) = act(compose(&r, &cand()));
@@ -1140,7 +1334,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop_rel", 0.97),
             "desktop_direction": choice("sideways", 0.99),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.01),
         }));
         unclear(compose(&r, &cand()));
@@ -1148,7 +1342,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop_rel", 0.97),
             "desktop_direction": choice("previous", 0.99),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.01),
         }));
         let (got, _) = act(compose(&r, &cand()));
@@ -1162,14 +1356,14 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.94),
             "target": choice("Firefox", 0.99),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.03),
         }));
         assert!(unclear(compose(&r, &cand())).contains("never offered"));
 
         let r = resp(serde_json::json!({
             "intent": choice("reboot", 0.94),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.03),
         }));
         assert!(unclear(compose(&r, &cand())).contains("never offered"));
@@ -1180,7 +1374,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("start_claude", 0.96),
             "claude_model": choice(NO_TARGET, 0.98),
-            "is_dictation": noul(0.01),
+            "is_dictation": dictation(0.01),
             "is_destructive": noul(0.02),
         }));
         let (got, decision) = act(compose(&r, &cand()));
@@ -1189,22 +1383,153 @@ mod tests {
     }
 
     #[test]
-    fn payload_span_is_taken_verbatim_and_claude_tell_confirms() {
+    fn payload_cue_is_stripped_by_rule_and_claude_tell_confirms() {
+        // The cue rule finds the message; whatever span the model picked
+        // is not consulted, and neither is its confidence.
         let c = cand_with(&[], &[], 1, "tell claude to rerun the failing test");
+        assert!(!c.second_round("claude_tell").contains_key("payload"));
         let r = resp(serde_json::json!({
             "intent": choice("claude_tell", 0.93),
-            "payload": choice("p:2", 0.9),
-            "is_dictation": noul(0.2),
-            "is_destructive": noul(0.05),
+            "payload": choice("p:1", 0.3),
+            "is_dictation": dictation(0.2),
         }));
         let (got, decision) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::ClaudeTell {
-                text: "to rerun the failing test".into()
+                text: "rerun the failing test".into()
+            }
+        );
+        assert_eq!(got.confidence, 0.93);
+        assert!(matches!(decision, Decision::Confirm { .. }));
+    }
+
+    #[test]
+    fn payload_falls_back_to_the_model_span_when_no_cue_applies() {
+        let c = cand_with(&[], &[], 1, "let claude know the tests are green");
+        let second = c.second_round("claude_tell");
+        assert!(second.contains_key("payload"));
+        let offered = second["payload"].options().unwrap();
+        assert!(!offered.contains_key("p:0"), "the first word is never a message");
+        assert_eq!(offered.keys().last().map(String::as_str), Some(WHOLE));
+        let r = resp(serde_json::json!({
+            "intent": choice("claude_tell", 0.93),
+            "payload": choice("p:3", 0.8),
+            "is_dictation": dictation(0.02),
+        }));
+        let (got, _) = act(compose(&r, &c));
+        assert_eq!(
+            got.intent,
+            Intent::ClaudeTell {
+                text: "the tests are green".into()
+            }
+        );
+        assert_eq!(got.confidence, 0.8);
+
+        let whole = resp(serde_json::json!({
+            "intent": choice("notify", 0.93),
+            "payload": choice(WHOLE, 0.8),
+            "is_dictation": dictation(0.02),
+        }));
+        let (got, _) = act(compose(&whole, &c));
+        assert_eq!(
+            got.intent,
+            Intent::Notify {
+                text: "let claude know the tests are green".into()
+            }
+        );
+    }
+
+    #[test]
+    fn key_chord_is_mapped_by_rule_or_the_intent_is_unclear() {
+        let c = cand_with(&[], &[], 1, "hit control s");
+        let r = resp(serde_json::json!({
+            "intent": choice("key", 0.97),
+            "is_dictation": dictation(0.01),
+        }));
+        let (got, decision) = act(compose(&r, &c));
+        assert_eq!(
+            got.intent,
+            Intent::Key {
+                chord: "ctrl+s".into()
             }
         );
         assert!(matches!(decision, Decision::Confirm { .. }));
+
+        // A word that is not a key never becomes a chord.
+        let c = cand_with(&[], &[], 1, "press the any key");
+        let r = resp(serde_json::json!({
+            "intent": choice("key", 0.97),
+            "is_dictation": dictation(0.01),
+        }));
+        assert!(unclear(compose(&r, &c)).contains("not a key chord"));
+    }
+
+    #[test]
+    fn risk_is_the_intents_own_where_the_intent_decides_it() {
+        // Starting Claude Code cannot destroy work, whatever the model
+        // says, and the question is not even asked.
+        let c = cand();
+        assert!(!c.second_round("start_claude").contains_key("is_destructive"));
+        let r = resp(serde_json::json!({
+            "intent": choice("start_claude", 0.99),
+            "claude_model": choice(NO_TARGET, 0.99),
+            "is_dictation": dictation(0.01),
+            "is_destructive": noul(1.0),
+        }));
+        let (got, decision) = act(compose(&r, &c));
+        assert_eq!(
+            got.signals,
+            Signals::Judged {
+                confidence: 0.99,
+                destructive: Some(0.0),
+                dictation: Some(0.01),
+            }
+        );
+        assert_eq!(decision, Decision::Act);
+
+        // A search is the model's to judge, and its answer is kept.
+        let c = cand_with(&[], &[], 1, "look for the invoice");
+        assert!(c.second_round("krunner").contains_key("is_destructive"));
+        let r = resp(serde_json::json!({
+            "intent": choice("krunner", 0.99),
+            "is_dictation": dictation(0.01),
+            "is_destructive": noul(0.9),
+        }));
+        let (got, decision) = act(compose(&r, &c));
+        assert!(matches!(got.signals, Signals::Judged { destructive: Some(d), .. } if d == 0.9));
+        assert!(matches!(decision, Decision::Confirm { .. }));
+    }
+
+    #[test]
+    fn rounds_ask_only_what_the_intent_needs() {
+        let c = cand_with(&[], &[], 2, "remind me to buy milk");
+        let first = c.first_round();
+        assert_eq!(first.keys().collect::<Vec<_>>(), ["intent", "is_dictation"]);
+        assert!(c.second_round("notify").is_empty(), "cue found, risk never");
+        assert!(c.second_round("open_terminal").is_empty());
+        assert!(c.second_round(NO_TARGET).is_empty());
+        assert_eq!(
+            c.second_round("show_app").keys().collect::<Vec<_>>(),
+            ["target"]
+        );
+        assert_eq!(
+            c.second_round("virtual_desktop").keys().collect::<Vec<_>>(),
+            ["desktop_number"]
+        );
+        assert_eq!(
+            c.second_round("virtual_desktop_rel").keys().collect::<Vec<_>>(),
+            ["desktop_direction"]
+        );
+        assert_eq!(
+            c.second_round("claude_model").keys().collect::<Vec<_>>(),
+            ["claude_model"]
+        );
+        assert_eq!(
+            c.second_round("edit_text").keys().collect::<Vec<_>>(),
+            ["is_destructive"]
+        );
+        assert!(c.second_round("key").contains_key("payload"), "no key cue in this utterance");
     }
 
     #[test]
@@ -1214,7 +1539,7 @@ mod tests {
             "intent": choice("krunner", 0.93),
             "target": choice("a:0", 0.9),
             "payload": choice("p:2", 0.9),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.01),
         }));
         let (got, _) = act(compose(&r, &c));
@@ -1232,7 +1557,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.9),
             "target": choice("w:0", 0.95),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.02),
         }));
         let (got, _) = act(compose(&r, &c));
@@ -1247,7 +1572,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("minimize_window", 0.9),
             "target": choice("w:1", 0.95),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.02),
         }));
         let (got, _) = act(compose(&r, &c));
@@ -1266,7 +1591,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.9),
             "target": choice("a:0", 0.95),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.02),
         }));
         let (got, _) = act(compose(&r, &c));
@@ -1286,7 +1611,7 @@ mod tests {
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.9),
             "target": choice("w:0", 0.95),
-            "is_dictation": noul(0.02),
+            "is_dictation": dictation(0.02),
             "is_destructive": noul(0.02),
         }));
         let (got, _) = act(compose(&r, &c));

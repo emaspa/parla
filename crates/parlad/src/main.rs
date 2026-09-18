@@ -21,6 +21,7 @@ mod local;
 mod lock;
 mod openai;
 mod oracle;
+mod payload;
 mod policy;
 mod router;
 mod typesafe;

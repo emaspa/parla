@@ -16,10 +16,13 @@
 #   direction      next or previous, for virtual_desktop_rel
 #   payload        the text a claude_tell, notify, krunner or key must carry;
 #                  a leading "to", "that" or "the" in what was resolved is
-#                  tolerated
+#                  tolerated. A key chord is given as spoken ("control s")
+#                  and compared with the chord the judge built ("ctrl+s")
 #   model          opus, sonnet or haiku, for start_claude and claude_model
 #   last_dictation judge as if text was just dictated, so edit_text is offered
-#   destructive    whether the model ought to flag the action as destructive
+#   destructive    whether the model ought to flag the action as destructive;
+#                  only krunner and edit_text ask the model, every other
+#                  intent's risk is decided by rule, so only those count
 
 [state]
 desktop_count = 4
@@ -228,7 +231,6 @@ desktop = 3
 say = "bring up firefox"
 expect = "show_app"
 target = "firefox"
-destructive = false
 
 [[case]]
 say = "could you get the browser in front of me"
@@ -249,7 +251,6 @@ target = "dolphin"
 say = "show me kate"
 expect = "show_app"
 target = "kate"
-destructive = false
 
 [[case]]
 say = "bring the report document to the front"
@@ -350,7 +351,6 @@ expect = "unclear"
 say = "get rid of the spotify window"
 expect = "close_window"
 target = "spotify"
-destructive = false
 
 [[case]]
 say = "kill the discord window"
@@ -361,7 +361,6 @@ target = "discord"
 say = "shut down the browser"
 expect = "close_window"
 target = "firefox"
-destructive = false
 
 [[case]]
 say = "quit the mail client"
@@ -372,25 +371,21 @@ target = "thunderbird"
 say = "get rid of the terminal running the build"
 expect = "close_window"
 target = "build"
-destructive = true
 
 [[case]]
 say = "dismiss the downloads window"
 expect = "close_window"
 target = "downloads"
-destructive = false
 
 [[case]]
 say = "quit kate"
 expect = "close_window"
 target = "kate"
-destructive = true
 
 [[case]]
 say = "shut the editor with main.rs in it"
 expect = "close_window"
 target = "main.rs"
-destructive = true
 
 [[case]]
 say = "get that window out of here"
@@ -403,7 +398,6 @@ target = "focused"
 say = "hide the browser"
 expect = "minimize_window"
 target = "firefox"
-destructive = false
 
 [[case]]
 say = "minimise the discord window"
@@ -414,19 +408,16 @@ target = "discord"
 say = "put the mail window out of the way"
 expect = "minimize_window"
 target = "thunderbird"
-destructive = false
 
 [[case]]
 say = "hide the terminal"
 expect = "minimize_window"
 target = "konsole"
-destructive = false
 
 [[case]]
 say = "send kate to the taskbar"
 expect = "minimize_window"
 target = "kate"
-destructive = false
 
 [[case]]
 say = "hide this window"
@@ -444,13 +435,11 @@ target = "spotify"
 say = "make the browser full screen"
 expect = "maximize_window"
 target = "firefox"
-destructive = false
 
 [[case]]
 say = "make kate fill the screen"
 expect = "maximize_window"
 target = "kate"
-destructive = false
 
 [[case]]
 say = "maximise the writer document"
@@ -478,7 +467,6 @@ target = "focused"
 say = "take me to desktop three"
 expect = "virtual_desktop"
 desktop = 3
-destructive = false
 
 [[case]]
 say = "jump to the fourth desktop"
@@ -513,7 +501,6 @@ expect = "virtual_desktop_rel"
 direction = "next"
 accept = ["virtual_desktop"]
 desktop = 3
-destructive = false
 
 [[case]]
 say = "go back one desktop"
@@ -545,12 +532,10 @@ direction = "previous"
 [[case]]
 say = "give me a fresh terminal"
 expect = "open_terminal"
-destructive = false
 
 [[case]]
 say = "I need a new shell"
 expect = "open_terminal"
-destructive = false
 
 [[case]]
 say = "spin up a console for me"
@@ -571,7 +556,6 @@ accept = ["show_app"]
 [[case]]
 say = "fire up claude code"
 expect = "start_claude"
-destructive = false
 
 [[case]]
 say = "get a claude session going with opus"
@@ -586,7 +570,6 @@ model = "haiku"
 [[case]]
 say = "kick off a claude code session"
 expect = "start_claude"
-destructive = false
 
 [[case]]
 say = "bring claude to life using sonnet"
@@ -614,7 +597,6 @@ model = "opus"
 say = "put claude on sonnet"
 expect = "claude_model"
 model = "sonnet"
-destructive = false
 
 [[case]]
 say = "switch claude over to the quick one"
@@ -653,6 +635,21 @@ say = "send claude the message: run the linter"
 expect = "claude_tell"
 payload = "run the linter"
 
+[[case]]
+say = "claude, add a readme please"
+expect = "claude_tell"
+payload = "add a readme"
+
+[[case]]
+say = "say to claude: use tabs not spaces"
+expect = "claude_tell"
+payload = "use tabs not spaces"
+
+[[case]]
+say = "message claude that the build is green"
+expect = "claude_tell"
+payload = "the build is green"
+
 # ------------------------------------------------------------- claude_read
 
 [[case]]
@@ -670,7 +667,6 @@ expect = "claude_read"
 [[case]]
 say = "read me the claude output"
 expect = "claude_read"
-destructive = false
 
 [[case]]
 say = "check on claude"
@@ -682,11 +678,13 @@ expect = "claude_read"
 say = "look up last year's tax return"
 expect = "krunner"
 payload = "last year's tax return"
+destructive = false
 
 [[case]]
 say = "locate the invoice pdf"
 expect = "krunner"
 payload = "invoice pdf"
+destructive = false
 
 [[case]]
 say = "can you look for the vacation photos"
@@ -702,6 +700,41 @@ payload = "my thesis draft"
 say = "where is the file called budget"
 expect = "krunner"
 payload = "budget"
+destructive = false
+
+[[case]]
+say = "look up the invoice from march"
+expect = "krunner"
+payload = "the invoice from march"
+
+[[case]]
+say = "please find the document named budget"
+expect = "krunner"
+payload = "budget"
+
+[[case]]
+say = "where's my thesis"
+expect = "krunner"
+payload = "my thesis"
+
+# A run command may do anything; these must be flagged.
+[[case]]
+say = "run rm -rf on downloads"
+expect = "krunner"
+payload = "rm -rf on downloads"
+destructive = true
+
+[[case]]
+say = "look up the cache folder and wipe it"
+expect = "krunner"
+payload = "the cache folder and wipe it"
+destructive = true
+
+[[case]]
+say = "locate the backups folder and get rid of it"
+expect = "krunner"
+payload = "the backups folder and get rid of it"
+destructive = true
 
 # ------------------------------------------------------------------ notify
 
@@ -730,6 +763,32 @@ say = "let me know with a notification that the pizza is here"
 expect = "notify"
 payload = "the pizza is here"
 
+[[case]]
+say = "remind me that the laundry is done"
+expect = "notify"
+payload = "the laundry is done"
+
+[[case]]
+say = "make a note that rent is due on the first"
+expect = "notify"
+payload = "rent is due on the first"
+
+[[case]]
+say = "set a reminder to call the dentist"
+expect = "notify"
+payload = "call the dentist"
+
+[[case]]
+say = "show a notification saying the build finished"
+expect = "notify"
+payload = "the build finished"
+
+# The text carried mentions a door; it is still a notification.
+[[case]]
+say = "remind me to close the door"
+expect = "notify"
+payload = "close the door"
+
 # --------------------------------------------------------------------- key
 
 [[case]]
@@ -757,22 +816,58 @@ say = "send control shift t"
 expect = "key"
 payload = "control shift t"
 
+# Phrasings the cue rules and the chord mapper must survive: filler words
+# around the keys, "plus" between them, spoken numbers, a polite wrapper.
+
+[[case]]
+say = "could you press the escape key"
+expect = "key"
+payload = "escape"
+
+[[case]]
+say = "do a control z please"
+expect = "key"
+payload = "control z"
+
+[[case]]
+say = "type shift enter"
+expect = "key"
+payload = "shift enter"
+
+[[case]]
+say = "send f five"
+expect = "key"
+payload = "f five"
+
+[[case]]
+say = "hit control plus s"
+expect = "key"
+payload = "control s"
+
+# A word that is not a key must not become a chord.
+[[case]]
+say = "hit the any key"
+expect = "unclear"
+
 # --------------------------------------------------------------- edit_text
 
 [[case]]
 say = "make that more formal"
 expect = "edit_text"
 last_dictation = true
+destructive = false
 
 [[case]]
 say = "shorter"
 expect = "edit_text"
 last_dictation = true
+destructive = false
 
 [[case]]
 say = "turn that into bullet points"
 expect = "edit_text"
 last_dictation = true
+destructive = false
 
 [[case]]
 say = "translate that to italian"
@@ -851,6 +946,22 @@ expect = "dictation"
 
 [[case]]
 say = "Open the window a little, it's hot in here."
+expect = "dictation"
+
+[[case]]
+say = "Can you pick up the kids at four, I'm stuck in traffic."
+expect = "dictation"
+
+[[case]]
+say = "Thanks everyone, great work this sprint."
+expect = "dictation"
+
+[[case]]
+say = "The invoice is attached, let me know if anything is missing."
+expect = "dictation"
+
+[[case]]
+say = "See you at the office tomorrow morning."
 expect = "dictation"
 
 # ----------------------------------------------------------------- unclear

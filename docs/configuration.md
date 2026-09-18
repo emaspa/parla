@@ -198,10 +198,10 @@ list of options.
 enabled = true
 backend = "local"
 timeout_ms = 4000
-# Defaults depend on the backend: local 0.35/0.65/0.4/0.8, typesafe 0.45/0.75/0.5/0.6; set a key to override.
+# Defaults depend on the backend: local 0.35/0.8/0.5/0.8, typesafe 0.45/0.75/0.5/0.6; set a key to override.
 # min_confidence = 0.35
-# act_unconfirmed_above = 0.65
-# dictation_threshold = 0.4
+# act_unconfirmed_above = 0.8
+# dictation_threshold = 0.5
 # destructive_threshold = 0.8
 send_window_titles = false
 
@@ -213,9 +213,10 @@ The judged path handles command-mode utterances the grammar does not match.
 `enabled = false` makes those refusals instead: the grammar still works.
 
 `backend` is `local` for the model under `[local]`, or `typesafe` for the
-TypeSafe System One API. `timeout_ms` bounds one judgment. Past it the
-command fails with an error rather than acting late on something the user
-has already given up on.
+TypeSafe System One API. `timeout_ms` bounds each of the judge's two
+requests, the intent and then what the intent needs. Past it the command
+fails with an error rather than acting late on something the user has
+already given up on.
 
 The four thresholds are probabilities the policy compares against. They are
 described with the decision procedure in [commands.md](commands.md). Each
@@ -228,8 +229,8 @@ alone. Each must be within 0 and 1, and `min_confidence` must not exceed
 | key | `local` | `typesafe` |
 | --- | --- | --- |
 | `min_confidence` | 0.35 | 0.45 |
-| `act_unconfirmed_above` | 0.65 | 0.75 |
-| `dictation_threshold` | 0.4 | 0.5 |
+| `act_unconfirmed_above` | 0.8 | 0.75 |
+| `dictation_threshold` | 0.5 | 0.5 |
 | `destructive_threshold` | 0.8 | 0.6 |
 
 The local numbers come from `parlad --calibrate` over the corpus in

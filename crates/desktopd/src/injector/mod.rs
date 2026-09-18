@@ -82,7 +82,7 @@ pub fn normalize_chord(chord: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_chord;
+    use super::{eis, normalize_chord, ydotool};
 
     #[test]
     fn chord_normalization() {
@@ -91,5 +91,17 @@ mod tests {
         assert_eq!(normalize_chord("Super  Esc"), vec!["meta", "escape"]);
         assert_eq!(normalize_chord("win+del"), vec!["meta", "delete"]);
         assert_eq!(normalize_chord("  +  "), Vec::<String>::new());
+    }
+
+    /// Every key name the chord mapper can emit has to be one both
+    /// injectors can send, or a spoken chord fails at injection time.
+    #[test]
+    fn every_spoken_key_name_is_known_to_both_injectors() {
+        for name in parla_grammar::chord::key_names() {
+            let keys = normalize_chord(&name);
+            assert_eq!(keys, vec![name.clone()], "normalize_chord changed {name:?}");
+            assert!(ydotool::keycode(&name).is_some(), "ydotool has no keycode for {name:?}");
+            assert!(eis::keysym_for(&name).is_ok(), "EIS has no keysym for {name:?}");
+        }
     }
 }

@@ -87,12 +87,15 @@ parlad --judge "bring the file manager to the front"
 runs one utterance against the live desktop and prints which path took it,
 what the model answered, and whether the policy would act, ask or refuse.
 
-The judge sends one request with the utterance and the state code already
-knows: which applications are installed, which windows are open, how many
-desktops exist. Candidates come from that state, so the model cannot name
-a target that does not exist. Whether something already runs comes from
-the window list, not from the model. A message for Claude Code is copied
-from the utterance, never rewritten.
+The judge sends the utterance with the state code already knows: which
+applications are installed, which windows are open, how many desktops
+exist. A first round asks for the intent and whether the words were prose;
+a second asks only for what that intent needs. Candidates come from that
+state, so the model cannot name a target that does not exist. Whether
+something already runs comes from the window list, not from the model.
+Payloads are cut from the utterance by rule where one applies: "remind me
+to call Alan" notifies "call Alan", and "hit control s" becomes the chord
+`ctrl+s` without the model choosing the words.
 
 The local model never generates text for the judge. Every question has a
 closed set of answers, and each option is scored by the probability the

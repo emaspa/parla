@@ -3,6 +3,7 @@
 //! phrases are data, not code.
 
 pub mod builtin;
+pub mod chord;
 pub mod intent;
 pub mod normalize;
 pub mod pattern;

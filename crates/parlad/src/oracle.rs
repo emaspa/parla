@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::local::LocalModel;
@@ -40,7 +41,7 @@ pub enum Question {
     /// give it a no-match option when the set may not cover the input.
     Choice {
         instructions: Prose,
-        criteria: BTreeMap<String, Prose>,
+        criteria: Criteria,
     },
     /// Position along ordered levels (2–10). Unused so far, kept because the
     /// wire type is part of the TypeSafe API surface.
@@ -51,9 +52,81 @@ pub enum Question {
     },
 }
 
+/// The options of a choice question, in the order the model reads them.
+/// A JSON object on the wire, but ordered: the local model sees the list
+/// as rendered, and a "none of these" option belongs at its end, after
+/// the candidates it rejects.
+#[derive(Debug, Clone, Default)]
+pub struct Criteria(Vec<(String, Prose)>);
+
+impl Criteria {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append an option; a key already present is replaced in place.
+    pub fn insert(&mut self, key: impl Into<String>, desc: Prose) {
+        let key = key.into();
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some(slot) => slot.1 = desc,
+            None => self.0.push((key, desc)),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Prose> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Prose)> {
+        self.0.iter().map(|(k, v)| (k, v))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.0.iter().map(|(k, _)| k)
+    }
+}
+
+impl<K: Into<String>, const N: usize> From<[(K, Prose); N]> for Criteria {
+    fn from(items: [(K, Prose); N]) -> Self {
+        let mut c = Self::new();
+        for (k, v) in items {
+            c.insert(k, v);
+        }
+        c
+    }
+}
+
+impl<K: Into<String>> FromIterator<(K, Prose)> for Criteria {
+    fn from_iter<I: IntoIterator<Item = (K, Prose)>>(iter: I) -> Self {
+        let mut c = Self::new();
+        for (k, v) in iter {
+            c.insert(k, v);
+        }
+        c
+    }
+}
+
+impl Serialize for Criteria {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
 impl Question {
     /// The option names a choice question offers; None for other kinds.
-    pub fn options(&self) -> Option<&BTreeMap<String, Prose>> {
+    pub fn options(&self) -> Option<&Criteria> {
         match self {
             Question::Choice { criteria, .. } => Some(criteria),
             _ => None,
@@ -170,6 +243,21 @@ mod tests {
 
     fn parse(v: serde_json::Value) -> Response {
         serde_json::from_value(v).expect("response should deserialize")
+    }
+
+    #[test]
+    fn criteria_keep_insertion_order_and_serialize_as_an_object() {
+        let mut c = Criteria::new();
+        c.insert("b", serde_json::json!("second"));
+        c.insert("a", serde_json::json!("first"));
+        c.insert("b", serde_json::json!("replaced"));
+        assert_eq!(c.keys().cloned().collect::<Vec<_>>(), vec!["b", "a"]);
+        assert_eq!(c.len(), 2);
+        assert!(c.contains_key("a") && !c.contains_key("c"));
+        assert_eq!(
+            serde_json::to_string(&c).unwrap(),
+            r#"{"b":"replaced","a":"first"}"#
+        );
     }
 
     #[test]

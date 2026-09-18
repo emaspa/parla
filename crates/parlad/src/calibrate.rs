@@ -476,10 +476,11 @@ fn check_args(case: &Case, intent: &Intent) -> bool {
             .payload
             .as_deref()
             .is_none_or(|p| payload_matches(query, p)),
+        // The case says the chord as spoken; the judge builds key names.
         Intent::Key { chord } => case
             .payload
             .as_deref()
-            .is_none_or(|p| payload_matches(chord, p)),
+            .is_none_or(|p| parla_grammar::chord::spoken_chord(p).as_deref() == Some(chord)),
         Intent::StartClaude { model } => case
             .model
             .as_deref()
@@ -512,12 +513,16 @@ fn print_line(o: &Outcome<'_>, policy: &Policy) {
         .confidence
         .map(|c| format!("{c:.2}"))
         .unwrap_or_else(|| "  - ".into());
+    // Risk is only asked where the intent leaves it to the model.
+    let destr = o
+        .destructive
+        .map(|d| format!("{d:.2}"))
+        .unwrap_or_else(|| "  - ".into());
     println!(
-        "{status} {:<19} {:<19} {target} conf {conf} dict {:.2} destr {:.2} {:<20} {:?}  [{}]",
+        "{status} {:<19} {:<19} {target} conf {conf} dict {:.2} destr {destr} {:<20} {:?}  [{}]",
         o.case.expect,
         o.got,
         o.dictation.unwrap_or(f64::NAN),
-        o.destructive.unwrap_or(f64::NAN),
         decision_word(&o.decide(policy)),
         o.case.say,
         o.detail,
@@ -830,7 +835,7 @@ fn summarize(outcomes: &[Outcome<'_>], policy: &Policy) {
         .filter_map(|o| Some((o.destructive?, o.case.destructive?)))
         .collect();
     if destr_pairs.is_empty() {
-        println!("  no case sets `destructive`");
+        println!("  no case the model was asked about sets `destructive` (only krunner and edit_text are asked)");
     } else {
         let yes: Vec<f64> = destr_pairs
             .iter()
@@ -874,6 +879,28 @@ mod tests {
         assert!(payload_matches("Fix the  test", "fix the test"));
         assert!(!payload_matches("please fix the test", "fix the test"));
         assert!(!payload_matches("fix the test", "to fix the test"));
+    }
+
+    #[test]
+    fn key_payload_is_compared_as_a_chord() {
+        let case = |payload: &str| Case {
+            say: String::new(),
+            expect: "key".into(),
+            accept: vec![],
+            target: None,
+            desktop: None,
+            direction: None,
+            payload: Some(payload.into()),
+            model: None,
+            last_dictation: false,
+            destructive: None,
+        };
+        let key = |chord: &str| Intent::Key {
+            chord: chord.into(),
+        };
+        assert!(check_args(&case("control s"), &key("ctrl+s")));
+        assert!(check_args(&case("ctrl+s"), &key("ctrl+s")));
+        assert!(!check_args(&case("control shift s"), &key("ctrl+s")));
     }
 
     #[test]

@@ -862,7 +862,7 @@ fn now_micros() -> u64 {
 
 /// Chord key name → X11 keysym. Used for both the ei_text.keysym path and
 /// keymap lookups on the ei_keyboard path.
-fn keysym_for(key: &str) -> anyhow::Result<xkb::Keysym> {
+pub(crate) fn keysym_for(key: &str) -> anyhow::Result<xkb::Keysym> {
     use xkb::Keysym;
     let sym = match key {
         "ctrl" | "control" => Keysym::Control_L,

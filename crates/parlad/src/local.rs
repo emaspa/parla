@@ -337,9 +337,20 @@ impl<'m> Worker<'m> {
         };
         for (id, q) in questions {
             let rendered = render(&state_text, q);
+            tracing::trace!("question {id} as rendered:\n{}", rendered.prompt);
             let prompt = self.wrap(JUDGE_SYSTEM_PROMPT, &rendered.prompt)?;
             let logp = self.score(&prompt, &rendered.options, &mut usage)?;
             let probs = softmax(&logp);
+            tracing::trace!(
+                "question {id} scores: {}",
+                rendered
+                    .options
+                    .iter()
+                    .zip(&probs)
+                    .map(|(o, p)| format!("{o} {p:.3}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             let answer =
                 match q {
                     Question::Noul { .. } => Answer::Noul { noul: probs[0] },
@@ -595,7 +606,7 @@ fn render(state: &str, q: &Question) -> Rendered {
             text.push_str("Question: ");
             text.push_str(&prose(instructions));
             text.push_str("\n\nAllowed answers, one per line as `key: meaning`:\n");
-            for (key, desc) in criteria {
+            for (key, desc) in criteria.iter() {
                 text.push_str(&format!("{key}: {}\n", prose(desc).replace('\n', " ")));
             }
             text.push_str("\nReply with the key only.");
@@ -674,6 +685,7 @@ fn softmax(logp: &[f64]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::Criteria;
     use serde_json::json;
 
     #[test]
@@ -716,13 +728,13 @@ mod tests {
     fn choice_options_follow_the_criteria_order() {
         let q = Question::Choice {
             instructions: json!({"task": "pick"}),
-            criteria: BTreeMap::from([
-                ("__none__".into(), json!("nothing")),
-                ("a:0".into(), json!("installed application Firefox")),
+            criteria: Criteria::from([
+                ("a:0", json!("installed application Firefox")),
+                ("__none__", json!("nothing")),
             ]),
         };
         let r = render("{}", &q);
-        assert_eq!(r.options, vec!["__none__", "a:0"]);
+        assert_eq!(r.options, vec!["a:0", "__none__"]);
         assert!(r.prompt.contains("a:0: installed application Firefox\n"));
         assert!(r.prompt.contains("task: pick"));
     }

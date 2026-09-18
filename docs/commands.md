@@ -80,32 +80,64 @@ slot is skipped with a warning.
 ## The judged path
 
 What the grammar rejects goes to a model, unless `judge.enabled` is false,
-in which case it is refused. The judge sends one request that carries the
-utterance plus the state code already knows, and asks every question at
-once:
+in which case it is refused. The judge sends the utterance plus the state
+code already knows, and asks in two rounds. The first round asks two
+questions of every utterance:
 
 - `intent`: which single action was asked for, from a closed list:
   `show_app`, `close_window`, `minimize_window`, `maximize_window`,
   `virtual_desktop`, `virtual_desktop_rel`, `open_terminal`, `start_claude`,
   `claude_model`, `claude_tell`, `claude_read`, `krunner`, `notify`, `key`,
-  and `edit_text` while a dictation is fresh.
-- `is_dictation`: is the utterance prose the user wanted typed, rather than
-  an instruction? A yes means the user held the wrong hotkey.
-- `is_destructive`: could carrying this out destroy unsaved work or be hard
-  to undo? The model is told to judge the actual target in the window list,
-  not the verb alone.
+  and `edit_text` while a dictation is fresh. The model reads the "not a
+  desktop command" option first and the actions after it by name. That is
+  the order the calibration below was measured with; with the refusal
+  last, as the target list has it, three more cases went to a wrong
+  intent and one more wrong act went unconfirmed.
+- `is_dictation`: was the utterance a command for the assistant, text the
+  user meant to have typed, or neither, meaning a question for the
+  assistant, a fragment or noise? The weight on "text" is the dictation
+  probability; a high one means the user held the wrong hotkey. It is a
+  three-way choice rather than a yes/no because, asked "text or command",
+  the model called every command that carries text a reminder, a search,
+  a message for Claude Code, all of it text.
+
+The second round asks only what the chosen intent still needs. It never
+asks for a message a cue rule already found, or for a risk the intent
+itself decides:
+
 - `target`: which installed application or open window was meant. The
   candidates are the real ones, so the model cannot name something that is
-  not there.
+  not there. The list ends with the focused window (what "this window" or
+  a request that names no window means) and "none of these".
 - `desktop_number` and `desktop_direction`: which desktop, when the intent
   is a desktop switch. On a one-desktop machine there is no number to
   choose.
 - `claude_model`: opus, sonnet, haiku, or none named.
 - `payload`: for a message to pass on verbatim, which trailing span of the
-  utterance is the message. For "tell claude to fix the failing test" the
-  candidates are "to fix the failing test", "fix the failing test", and so
-  on, and the model picks where the command wrapper ends. The text reaches
-  Claude Code as spoken, never rewritten.
+  utterance is the message. Code answers this first. A rule strips a cue
+  phrase at the start, such as "tell claude to", "remind me to", "search
+  for" or "hit", everything before "saying" or "that says", and everything
+  before a colon when the words before it are the wrapper;
+  `crates/parlad/src/payload.rs` has the list. The judge asks
+  the model only when no rule applies, and then the spans on offer start
+  at the second word, with the whole utterance last and described as the
+  answer only when no word of it is a command wrapper. For "let claude know the
+  tests pass" the candidates are "claude know the tests pass", "know the
+  tests pass", "the tests pass", and so on. The text reaches Claude Code as
+  spoken, never rewritten.
+- `is_destructive`: could carrying this out destroy unsaved work or be hard
+  to undo? Asked only for `krunner`, since a run command may do anything,
+  and `edit_text`. For every other intent `policy::risk_rule` decides.
+  Showing, minimizing or maximizing a window, switching desktop, opening a
+  terminal, starting or reading Claude Code, changing its model and a
+  notification are never destructive. Closing a window, a key chord and a
+  message to Claude Code always ask first anyway. A test checks the rule
+  against `Intent::needs_confirmation`.
+
+Code builds a key chord from the spoken words, in `parla_grammar::chord`.
+"control shift t" becomes `ctrl+shift+t`, "f five" `f5`, "the escape key"
+`escape`. A word that is not a key makes the intent unclear rather than a
+chord, so "hit the any key" presses nothing.
 
 `show_app` covers both launching and focusing. Whether the application
 already has a window is an observed fact, so code decides that and the model
@@ -171,7 +203,7 @@ acts. Closing can discard unsaved state, a shortcut and a key chord can do
 anything, and a message to Claude Code makes an agent act on it.
 
 The four thresholds are per backend. A key left out of `[judge]` takes
-the backend's default: for `local` 0.35, 0.65, 0.4 and 0.8; for `typesafe`
+the backend's default: for `local` 0.35, 0.8, 0.5 and 0.8; for `typesafe`
 0.45, 0.75, 0.5 and 0.6. The local numbers come from the calibration run
 below.
 
@@ -185,7 +217,9 @@ applies wins:
    sure intent with an unsure target is an unsure command.
 3. An intent that always confirms: ask.
 4. No `is_destructive` answer: ask. A missing safety answer is never taken
-   as safe.
+   as safe. An intent whose risk the rule decides arrives with 0, or with
+   no answer and an always-confirm rule that already fired at step 3, so
+   this step only bites where the model was asked.
 5. `is_destructive` at or above `judge.destructive_threshold`: ask.
 6. No `is_dictation` answer: ask.
 7. Confidence below `judge.act_unconfirmed_above`: ask.
@@ -218,19 +252,22 @@ The tool reports and skips a case the grammar matches, since it never
 reaches the judge. Every other case prints one line:
 
 ```
-ok    show_app  show_app  target ok  conf 1.00 dict 0.00 destr 0.00 act  "bring up firefox"  ["GitHub - Mozilla Firefox"]
-WRONG key       key                  conf 1.00 dict 0.00 destr 0.00 ask  "hit control s"     ["hit control s"]
+ok    show_app  show_app  target ok  conf 1.00 dict 0.00 destr   -  act  "bring up firefox"  ["GitHub - Mozilla Firefox"]
+WRONG krunner   unclear              conf   -  dict 0.00 destr   -  refuse(unclear)  "where's my thesis"  [__none__ 0.99: not a desktop command]
 ```
 
 In order: whether the verdict was right in every respect the case names;
 the expected intent; the intent the judge built (`unclear` when none
 could be); whether the target resolved to the one named; the weakest-link
-confidence; the `is_dictation` and `is_destructive` probabilities; what
-the policy would do under the thresholds in force (`act`, `ask`, or
-`refuse` with its reason); the utterance; and the resolved target or
-argument. A case that expects a refusal counts as right when the daemon
-would refuse it for any reason. Whether the model recognised prose as
-prose is a separate line in the summary.
+confidence; the `is_dictation` and `is_destructive` probabilities, the
+latter a dash when the rule decided the risk and the model was not
+asked; what the policy would do under the thresholds in force (`act`,
+`ask`, or `refuse` with its reason); the utterance; and the resolved
+target or argument. A case that expects a refusal counts as right when
+the daemon would refuse it for any reason. Whether the model recognised
+prose as prose is a separate line in the summary. A key payload is
+compared as a chord, so a case may say "control s" for the `ctrl+s` the
+judge builds.
 
 The summary gives intent accuracy over the cases that expect an action,
 target accuracy over the cases that name one, how many refusals happened
@@ -248,32 +285,66 @@ taking the low end of a tie there because a missed prompt costs more than
 a needless one.
 
 Measured on 2026-09-18 with Qwen3-4B-Instruct-2507-Q4_K_M on an RTX 5060,
-corpus of 135 cases, none matched by the grammar:
+corpus of 159 cases, none matched by the grammar:
 
 ```
-right in every respect: 99/135 (73%)
-intent accuracy:     82/101 (81%) on cases that expect an action; with arguments 66/101
-target accuracy:     30/42 (71%) on cases that name a target
-refusals:            34/34 (100%) of cases that expect a refusal got one
-prose:               14/14 refused, 6 of them recognised as dictation
-dictation detection: precision 1.00 recall 0.43 at dictation_threshold 0.40
-best score -12 at min_confidence 0.35, act_unconfirmed_above 0.65
-at the best pair: acts right 49, acts WRONG 9, asks right 16, asks wrong 18, refuses right 0
+right in every respect: 146/159 (92%)
+intent accuracy:     108/120 (90%) on cases that expect an action; with arguments 108/120
+target accuracy:     38/42 (90%) on cases that name a target
+refusals:            39/39 (100%) of cases that expect a refusal got one
+prose:               18/18 refused, 13 of them recognised as dictation
+dictation detection: precision 0.93 recall 0.72 at dictation_threshold 0.50
+best score 44 at min_confidence 0.35, act_unconfirmed_above 0.80 (72 pairs tie)
+at the best pair: acts right 78, acts WRONG 1, asks right 29, asks wrong 3, refuses right 0
 ```
 
-The local defaults are that pair, 0.4 for dictation and 0.8 for
-destructive. Two things the numbers say about this model. The confidence
-carries little. 59 of 65 right verdicts and 22 of 27 wrong ones score
-above 0.9, and any floor between 0.05 and 0.65 scores the same, so 0.35
-is the middle of that range rather than a measured edge. And the errors
-are systematic rather than uncertain. The model answers the payload
-question with the whole utterance for every `notify`, `key` and `krunner`
-case and for half of the `claude_tell` cases, so "hit control s" resolves
-to the chord "hit control s". It picks "no target" for "fire up gimp" with
-GIMP on the list. It calls eight of the fourteen prose cases not a
-command rather than dictation. It calls starting Claude Code or opening a
-shell destructive at 1.00. Those are for the questions and the model to
-fix, and no threshold moves them. The corpus has not been run with the
+The same corpus scored 99/135 before the payload, risk and target changes
+above. The 24 cases added since exercise the cue rules, the chord mapper,
+casual prose and the risk question. The local defaults are the best pair,
+0.5 for dictation and 0.8 for destructive. The pair is the middle of a
+wide tie. Every floor from 0.05 to 0.60 and every act threshold from 0.65
+to 0.90 scores the same, since 105 of the 107 right verdicts and 2 of the
+4 wrong ones sit above 0.9, so the confidence still separates little with
+this model. The dictation threshold sits above the tool's suggestion of
+0.15 on purpose. The commands the model puts between 0.2 and 0.5 are
+voice edits such as "make that more formal", which a lower threshold
+would refuse as prose, while prose that scores below 0.5 is refused as
+unclear anyway. The destructive threshold is measured on the eight
+`krunner` and `edit_text` cases that say: the model answers 1.00 for
+"look up the cache folder and wipe it" and "locate the backups folder and
+get rid of it" and 0.00 for the six harmless ones, so every threshold
+from 0.05 to 0.95 ties and 0.8 stays.
+
+What still fails. "take me to the terminal" opens a new terminal instead
+of focusing the open one. "run rm -rf on downloads" is read as closing the
+Downloads window, at 0.85, so it asks. "I'd like to look at my downloads folder"
+becomes a search. "I want to write some notes in obsidian" is called
+prose at 0.93, which it does read as. "get that window out of here"
+resolves "that window" to the Discord window rather than the focused one.
+"flip to the following desktop" and "switch claude over to the quick one"
+are read as a numbered desktop switch with no number, and refused. Six
+utterances fail at the intent step, five of them ones the cue rules would
+have handled: "where's my thesis", "make a note that rent is due on the
+first", "remind me to close the door", "do a control z please", "send f
+five" and "add a greeting at the top" all score "not a desktop command".
+Wordings that fixed some of these broke others. Mentioning reminders
+under `notify` and more chords under `key` fixed four and lost "hide the
+browser" to `close_window` again, so I did not keep them. The
+minimize/close split on "hide" is a near tie for this model and moves
+with unrelated wording.
+
+Two things to know when comparing runs. The answers are deterministic for
+a given corpus order, but the local model's shared cache is not
+numerically identical to decoding a prompt afresh, and on a near tie the
+answer moves with what the cache held. The same utterance judged first in
+a run and judged after another one can differ, and a wording change to
+one question can move a few unrelated cases through the cells it leaves
+behind. Totals are stable to about two cases; single flips near 0.5 are
+not evidence. And the model reads option keys only as well as they are
+explained. With the target question naming only the `w:` keys, every
+installed application scored 0.00 and "fire up gimp" resolved to nothing
+with GIMP on the list; one sentence saying what `a:` keys are moved the
+target accuracy from 67% to 79%. The corpus has not been run with the
 TypeSafe backend.
 
 To add a case, put it in `corpus/judge.toml` and rerun. The report says

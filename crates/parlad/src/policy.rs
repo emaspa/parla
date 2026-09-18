@@ -49,6 +49,37 @@ impl Default for Policy {
     }
 }
 
+/// Where an intent's risk comes from. Most intents decide it themselves:
+/// focusing a window or switching desktop destroys nothing, and closing a
+/// window or sending a key chord asks first whatever a model would say. Only
+/// a KRunner query (a run command may do anything) and an edit of dictated
+/// text are for the model to judge, so those are the only ones the judge
+/// asks about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Risk {
+    /// Cannot destroy work: the judged path reports probability 0 unasked.
+    Never,
+    /// [`Intent::needs_confirmation`] asks first, so a judgment is not
+    /// needed and not sought.
+    AlwaysConfirmed,
+    /// The model is asked `is_destructive`.
+    Judged,
+}
+
+/// The risk rule for an intent by the judge's name for it (`show_app`
+/// covers `launch_app` and `focus_window`). Names the judge cannot build
+/// are treated as judged, so a new intent asks until it is placed here.
+pub fn risk_rule(name: &str) -> Risk {
+    match name {
+        "show_app" | "launch_app" | "focus_window" | "open_terminal" | "start_claude"
+        | "claude_model" | "claude_read" | "virtual_desktop" | "virtual_desktop_rel"
+        | "notify" | "minimize_window" | "maximize_window" | "scratch_that" | "confirm"
+        | "deny" => Risk::Never,
+        "close_window" | "key" | "claude_tell" | "run_shortcut" => Risk::AlwaysConfirmed,
+        _ => Risk::Judged,
+    }
+}
+
 /// What is known about how an intent was obtained.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Signals {
@@ -181,6 +212,49 @@ mod tests {
         Intent::LaunchApp {
             query: "Firefox".into(),
         }
+    }
+
+    #[test]
+    fn risk_rule_agrees_with_the_always_confirm_list() {
+        // Every variant, so a new intent cannot be added to one list and
+        // not the other.
+        let samples = [
+            Intent::LaunchApp { query: String::new() },
+            Intent::OpenTerminal,
+            Intent::FocusWindow { query: String::new() },
+            Intent::CloseWindow { query: None },
+            Intent::MinimizeWindow { query: None },
+            Intent::MaximizeWindow { query: None },
+            Intent::VirtualDesktop { n: 1 },
+            Intent::VirtualDesktopRel { delta: 1 },
+            Intent::RunShortcut {
+                component: String::new(),
+                action: String::new(),
+            },
+            Intent::KRunner { query: String::new() },
+            Intent::StartClaude { model: None },
+            Intent::ClaudeModel { model: String::new() },
+            Intent::ClaudeTell { text: String::new() },
+            Intent::ClaudeRead,
+            Intent::Notify { text: String::new() },
+            Intent::Key { chord: String::new() },
+            Intent::ScratchThat,
+            Intent::EditText { instruction: String::new() },
+            Intent::Confirm,
+            Intent::Deny,
+        ];
+        for i in &samples {
+            let name = intent_name(i);
+            assert_eq!(
+                risk_rule(name) == Risk::AlwaysConfirmed,
+                i.needs_confirmation(),
+                "{name}"
+            );
+        }
+        assert_eq!(risk_rule("show_app"), Risk::Never);
+        assert_eq!(risk_rule("krunner"), Risk::Judged);
+        assert_eq!(risk_rule("edit_text"), Risk::Judged);
+        assert_eq!(risk_rule("something_new"), Risk::Judged);
     }
 
     #[test]

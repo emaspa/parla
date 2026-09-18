@@ -676,6 +676,7 @@ dependencies = [
  "futures-lite",
  "fuzzy-matcher",
  "libc",
+ "parla-grammar",
  "reis",
  "serde",
  "serde_json",

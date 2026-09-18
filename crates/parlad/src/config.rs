@@ -104,8 +104,8 @@ pub struct Thresholds {
 /// 1, so its floors are higher than TypeSafe's.
 pub const LOCAL_THRESHOLDS: Thresholds = Thresholds {
     min_confidence: 0.35,
-    act_unconfirmed_above: 0.65,
-    dictation_threshold: 0.4,
+    act_unconfirmed_above: 0.8,
+    dictation_threshold: 0.5,
     destructive_threshold: 0.8,
 };
 
@@ -712,14 +712,15 @@ mod tests {
         // load back with no key set, so the backend's table applies.
         let text = DaemonConfig::default_toml().unwrap();
         let judge = text.find("[judge]").unwrap();
+        let l = LOCAL_THRESHOLDS;
         for key in [
-            "\n# min_confidence = 0.35\n",
-            "\n# act_unconfirmed_above = 0.65\n",
-            "\n# dictation_threshold = 0.4\n",
-            "\n# destructive_threshold = 0.8\n",
-            "typesafe 0.45/0.75/0.5/0.6",
+            format!("\n# min_confidence = {}\n", l.min_confidence),
+            format!("\n# act_unconfirmed_above = {}\n", l.act_unconfirmed_above),
+            format!("\n# dictation_threshold = {}\n", l.dictation_threshold),
+            format!("\n# destructive_threshold = {}\n", l.destructive_threshold),
+            "typesafe 0.45/0.75/0.5/0.6".to_string(),
         ] {
-            let at = text.find(key).unwrap_or_else(|| panic!("{key:?} missing from\n{text}"));
+            let at = text.find(&key).unwrap_or_else(|| panic!("{key:?} missing from\n{text}"));
             assert!(at > judge && at < text.find("send_window_titles").unwrap(), "{text}");
         }
         assert!(!text.contains("\nmin_confidence = "), "{text}");

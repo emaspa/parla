@@ -37,7 +37,7 @@ by restarting; see [dictation.md](dictation.md).
 | `~/.config/parla/dictionary.toml` | Words to prime whisper with, and spoken-to-written replacements. |
 | `~/.config/parla/snippets.toml` | Phrases that expand to fixed text. |
 | `~/.config/parla/apps.toml` | Per-application cleanup profiles. Written on first save; until then the built-in defaults apply. |
-| `~/.local/share/parla/models/` | The whisper and GGUF models, where `scripts/fetch-model.sh` puts them. |
+| `~/.local/share/parla/models/` | The whisper, Silero VAD and GGUF models, where `scripts/fetch-model.sh` puts them. |
 | `~/.local/share/parla/history.jsonl` | One JSON record per utterance, when `flow.history` is on. |
 | `~/.local/state/parla/parlad.lock` | Held with `flock` while a daemon runs. |
 | `~/.config/autostart/parla-ui.desktop` | Written by the UI's "Start with the session" switch. |
@@ -68,6 +68,7 @@ System Settings shows as free.
 
 ```toml
 [audio]
+vad_threshold = 0.5
 speech_threshold = 0.01
 max_utterance_ms = 30000
 min_utterance_ms = 250
@@ -79,10 +80,18 @@ lists the names it can see. Absent means the system default. Capture runs
 at the device's own rate and is downmixed and resampled to the 16 kHz mono
 whisper expects.
 
-`speech_threshold` is an RMS level between 0 and 1. Frames above it count as
-speech. The gate trims leading and trailing silence and drops a capture that
-never rose above the threshold, since whisper hallucinates on silence. Raise
-it in a noisy room, lower it for a quiet microphone.
+The gate in front of whisper trims a capture to where speech is and drops
+one with no speech in it, since whisper hallucinates on silence. Which gate
+runs depends on whether the Silero model at `asr.vad_model_path` exists.
+
+`vad_threshold` is the Silero speech probability, between 0 and 1, at or
+above which a frame counts as speech. 0.5 is the model's own default; raise
+it if breathing or keyboard noise gets through, lower it if quiet speech
+is cut.
+
+`speech_threshold` is an RMS level between 0 and 1 for the energy gate,
+which runs only without the VAD model. Frames above it count as speech.
+Raise it in a noisy room, lower it for a quiet microphone.
 
 `min_utterance_ms` drops captures shorter than this after trimming, which
 catches accidental taps. `max_utterance_ms` caps what goes to whisper.
@@ -99,6 +108,7 @@ parse, do nothing, and produce a warning in the log.
 ```toml
 [asr]
 model_path = "~/.local/share/parla/models/ggml-large-v3-turbo.bin"
+vad_model_path = "~/.local/share/parla/models/ggml-silero-v5.1.2.bin"
 language = "en"
 threads = 4
 hallucination_blocklist = ["thank you", "thanks for watching", "the end", "subtitle"]
@@ -110,6 +120,12 @@ accurate enough that cleanup has little to fix. `language` is a whisper
 language code, or `auto` to detect per utterance. Detection costs a little
 time and occasionally guesses wrong on short utterances, so set the code
 when you dictate in one language.
+
+`vad_model_path` is whisper.cpp's Silero VAD model, `ggml-silero-v5.1.2.bin`
+from `scripts/fetch-model.sh vad`, under a megabyte and run on the CPU.
+When the file is missing the daemon starts anyway with the RMS energy gate
+in its place and says so in the log; `parlad --check` shows which gate is
+active.
 
 `initial_prompt` (absent by default) is text whisper sees before every
 utterance, which biases it toward that vocabulary. The dictionary's words are

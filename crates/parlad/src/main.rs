@@ -1,9 +1,9 @@
 //! parlad: the parla daemon (plan P1).
 //!
-//! PipeWire capture (cpal) → energy-gated utterance validation → whisper.cpp
-//! (CUDA) batch transcription → router: dictation keystrokes or fast-path
-//! commands. PTT hotkeys via kglobalaccel press/release signals. Pauses
-//! while the session is locked.
+//! PipeWire capture (cpal) → speech gate (Silero VAD, or the RMS energy gate
+//! without its model) → whisper.cpp (CUDA) batch transcription → router:
+//! dictation keystrokes or fast-path commands. PTT hotkeys via kglobalaccel
+//! press/release signals. Pauses while the session is locked.
 
 mod asr;
 mod audio;
@@ -44,6 +44,7 @@ use local::LocalModel;
 use parla_flow::Record;
 use parla_grammar::Grammar;
 use router::{Handled, Mode, Router};
+use vad::Gate;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -161,6 +162,8 @@ async fn run() -> anyhow::Result<()> {
             .context("ASR load task panicked")??,
     );
 
+    let gate = Arc::new(Gate::load(&cfg.asr, &cfg.audio));
+
     let local = load_local(&cfg).await;
     let judge = load_judge(&cfg, local.clone());
     let flow = load_flow(&cfg, local)?;
@@ -226,6 +229,7 @@ async fn run() -> anyhow::Result<()> {
     let worker = tokio::spawn(worker(
         job_rx,
         Arc::clone(&cfg),
+        Arc::clone(&gate),
         Arc::clone(&asr),
         Arc::clone(&router),
         lock_rx.clone(),
@@ -548,6 +552,7 @@ fn finish_capture(capture: &mut Option<Capture>, released: Option<Mode>, ctx: &L
 async fn worker(
     mut jobs: mpsc::Receiver<Job>,
     cfg: Arc<DaemonConfig>,
+    gate: Arc<Gate>,
     asr: Arc<Asr>,
     router: Arc<Router>,
     lock_rx: watch::Receiver<bool>,
@@ -561,7 +566,7 @@ async fn worker(
     {
         let t0 = std::time::Instant::now();
         let focused = focus.await.ok().flatten();
-        let heard = match transcribe(samples, &cfg.audio, &asr, router.flow()).await {
+        let heard = match transcribe(samples, &cfg.audio, &gate, &asr, router.flow()).await {
             Ok(h) => h,
             Err(e) => {
                 report(&cfg, bus.as_ref(), mode, Err(e));
@@ -663,6 +668,7 @@ struct Heard {
 async fn transcribe(
     samples: audio::Stopped,
     audio_cfg: &config::AudioConfig,
+    gate: &Arc<Gate>,
     asr: &Arc<Asr>,
     flow: &Flow,
 ) -> anyhow::Result<Heard> {
@@ -671,13 +677,20 @@ async fn transcribe(
     let samples = tokio::time::timeout(STOP_GRACE, samples)
         .await
         .context("capture device did not stop in time")??;
-    let trimmed = vad::validate(&samples, audio::SAMPLE_RATE, audio_cfg)?;
-    let audio_ms = trimmed.len() as u64 * 1000 / u64::from(audio::SAMPLE_RATE);
+    // The gate runs the VAD model on the CPU, so it shares the blocking
+    // thread with whisper rather than stalling the runtime.
+    let gate = Arc::clone(gate);
     let asr = Arc::clone(asr);
+    let audio_cfg = audio_cfg.clone();
     let prompt = flow.asr_prompt();
-    let transcript = tokio::task::spawn_blocking(move || asr.transcribe(&trimmed, prompt.as_deref()))
-        .await
-        .context("ASR task panicked")??;
+    let (transcript, audio_ms) = tokio::task::spawn_blocking(move || {
+        let trimmed = gate.validate(&samples, audio::SAMPLE_RATE, &audio_cfg)?;
+        let audio_ms = trimmed.len() as u64 * 1000 / u64::from(audio::SAMPLE_RATE);
+        let transcript = asr.transcribe(&trimmed, prompt.as_deref())?;
+        anyhow::Ok((transcript, audio_ms))
+    })
+    .await
+    .context("ASR task panicked")??;
     anyhow::ensure!(!transcript.is_empty(), "heard nothing usable");
     Ok(Heard {
         transcript,
@@ -895,6 +908,7 @@ async fn check() -> anyhow::Result<()> {
             "NO — run scripts/fetch-model.sh"
         }
     );
+    println!("vad:           {}", Gate::load(&cfg.asr, &cfg.audio).describe());
     let path = &cfg.local.model_path;
     println!("local model:   {}", path.display());
     println!(

@@ -13,8 +13,8 @@ history, the dictionary, the snippets and the per-app profiles.
 ## How an utterance travels
 
 ```
-hotkey held → PipeWire capture → energy gate → whisper.cpp → router → executor
-                                  (trim, reject)   (CUDA)        │
+hotkey held → PipeWire capture → Silero VAD → whisper.cpp → router → executor
+                                  (trim, reject)  (CUDA)         │
                                                     dictation ───┼─ snippets, dictionary, cleanup → typed
                                                     command  ────┼─ grammar      in-process
                                                                  ├─ judged path  local GGUF, or API
@@ -147,7 +147,7 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
 | `parla-grammar` | Intents and the literal-pattern grammar, including the confirm/deny replies |
 | `desktopd` | The executor and its `Command` vocabulary: windows, launching, the `.desktop` index, virtual desktops, tmux, text injection |
 | `parla-flow` | Dictionary, snippets, app profiles and history: the files both the daemon and the UI read |
-| `parlad` | The daemon: capture, energy gate, ASR, hotkeys, router, policy, confirmation, cleanup, judged path, session bus |
+| `parlad` | The daemon: capture, Silero VAD, ASR, hotkeys, router, policy, confirmation, cleanup, judged path, session bus |
 | `parla-ui` | The Kirigami UI: overlay, tray icon, history, dictionary, snippets, app profiles |
 
 ## Not done yet
@@ -156,8 +156,6 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
   the TypeSafe backend and never checked against a corpus of real
   utterances, on either backend. The local model's probabilities cluster
   at 0 and 1, which makes them blunt.
-- **The energy gate is not a VAD.** It trims silence and rejects stray taps
-  by RMS. A frame-level model can replace it behind the same interface.
 - **Voice edits replace text by backspacing.** "Scratch that" deletes as
   many characters as parla typed. An application that rewrote the text in
   the meantime, with autocorrect or autocomplete, is left with a mess.

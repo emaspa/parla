@@ -1,9 +1,11 @@
 #!/usr/bin/env sh
 # Download the models parlad expects by default: the whisper model that
-# transcribes speech and the GGUF the local judge reasons with.
+# transcribes speech, the Silero VAD model that gates it, and the GGUF the
+# local judge reasons with.
 #
-# Usage: scripts/fetch-model.sh                      both defaults
+# Usage: scripts/fetch-model.sh                      all three defaults
 #        scripts/fetch-model.sh whisper [ggml-name]  e.g. ggml-large-v3-turbo
+#        scripts/fetch-model.sh vad                  ggml-silero-v5.1.2.bin
 #        scripts/fetch-model.sh judge [repo file]    a Hugging Face repo and
 #                                                    the .gguf inside it
 #
@@ -15,6 +17,7 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 DIR="$DATA_HOME/parla/models"
 
 WHISPER_DEFAULT="ggml-large-v3-turbo"
+VAD_FILE="ggml-silero-v5.1.2.bin"
 JUDGE_REPO_DEFAULT="unsloth/Qwen3-4B-Instruct-2507-GGUF"
 JUDGE_FILE_DEFAULT="Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 
@@ -45,6 +48,10 @@ whisper() {
   fetch "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$name" "$DIR/$name"
 }
 
+vad() {
+  fetch "https://huggingface.co/ggml-org/whisper-vad/resolve/main/$VAD_FILE" "$DIR/$VAD_FILE"
+}
+
 judge() {
   repo="${1:-$JUDGE_REPO_DEFAULT}"
   file="${2:-$JUDGE_FILE_DEFAULT}"
@@ -52,8 +59,9 @@ judge() {
 }
 
 case "${1:-all}" in
-  all) whisper; judge ;;
+  all) whisper; vad; judge ;;
   whisper) shift; whisper "$@" ;;
+  vad) vad ;;
   judge) shift; judge "$@" ;;
-  *) echo "usage: $0 [whisper [name] | judge [repo file]]" >&2; exit 2 ;;
+  *) echo "usage: $0 [whisper [name] | vad | judge [repo file]]" >&2; exit 2 ;;
 esac

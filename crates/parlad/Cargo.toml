@@ -1,6 +1,6 @@
 [package]
 name = "parlad"
-description = "parla daemon: PipeWire capture, energy-gated VAD, whisper.cpp ASR, PTT hotkeys, router"
+description = "parla daemon: PipeWire capture, Silero VAD, whisper.cpp ASR, PTT hotkeys, router"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

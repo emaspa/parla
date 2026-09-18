@@ -9,7 +9,7 @@ middle holds the files both of them read.
 | `parla-grammar` | | The `Intent` type and the literal-pattern grammar, including the confirm and deny replies. No I/O. |
 | `desktopd` | `parla-probe` | The executor: windows, launching, the `.desktop` index, virtual desktops, shortcuts, tmux, notifications, text injection. Its own `Command` type; it does not depend on the grammar. |
 | `parla-flow` | | Dictionary, snippets, app profiles, history: the TOML and JSONL formats, with load, save and the matching rules. |
-| `parlad` | `parlad` | The daemon: hotkeys, capture, energy gate, whisper, router, policy, confirmation, cleanup, the judged path, the local model, the bus. |
+| `parlad` | `parlad` | The daemon: hotkeys, capture, speech gate, whisper, router, policy, confirmation, cleanup, the judged path, the local model, the bus. |
 | `parla-ui` | `parla-ui`, `parla-mockd` | The Kirigami UI and its stand-in daemon. Not in the default build set because it needs Qt. |
 
 `desktopd` is one implementation with two callers in mind. parlad maps
@@ -23,7 +23,7 @@ desktop later without a second implementation.
 kglobalaccel ── pressed ──▶ capture thread (cpal) ──▶ samples
                                                           │ released, or max_hold_ms
                                                           ▼
-                                             energy gate: trim, min length, reject silence
+                                             speech gate: Silero VAD (or RMS), trim, min length
                                                           │
                                                           ▼
                                              whisper.cpp on the GPU (spawn_blocking)
@@ -53,10 +53,17 @@ kglobalaccel ── pressed ──▶ capture thread (cpal) ──▶ samples
    PipeWire device can block and the stream handle is not `Send`. The
    callback downmixes to mono, resamples to 16 kHz, and computes an RMS
    level every 40 ms for the bus.
-3. **Gate.** At the release, leading and trailing silence is trimmed by RMS
-   against `audio.speech_threshold`. A capture shorter than
-   `audio.min_utterance_ms` after trimming, or one that never rose above the
-   threshold, is dropped before whisper sees it, because whisper on silence
+3. **Gate.** At the release, the capture is cut to where speech is, on the
+   blocking thread whisper uses. With the Silero model at
+   `asr.vad_model_path`, whisper.cpp's frame-level VAD returns speech
+   segments at `audio.vad_threshold`, and the capture is cut from the first
+   segment's start to the last segment's end, with a 30 ms pad at each end.
+   Pauses inside the span are kept: whisper copes with them, and
+   concatenating segments would move words in time. Without the model
+   file, or if the VAD call fails on a capture, the RMS energy gate trims
+   leading and trailing frames below `audio.speech_threshold` instead. A
+   capture with no speech, or shorter than `audio.min_utterance_ms` after
+   trimming, is dropped before whisper sees it, because whisper on silence
    produces "Thank you." with confidence.
 4. **Transcription.** whisper.cpp with CUDA, run on a blocking thread, with
    the dictionary's words as its initial prompt. Known silence

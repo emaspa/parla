@@ -48,12 +48,15 @@ of those if you want them.
 scripts/fetch-model.sh
 ```
 
-downloads `ggml-large-v3-turbo.bin` from the whisper.cpp releases and
+downloads `ggml-large-v3-turbo.bin` from the whisper.cpp releases,
+`ggml-silero-v5.1.2.bin` (the Silero VAD, under a megabyte) and
 `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` from Hugging Face into
 `~/.local/share/parla/models`, resumably, and is a no-op once the files are
 there. About 4 GB in total. `scripts/fetch-model.sh whisper ggml-medium` or
 `scripts/fetch-model.sh judge <repo> <file.gguf>` fetch a different one;
-point `asr.model_path` or `local.model_path` at it.
+point `asr.model_path` or `local.model_path` at it. Without the VAD file
+the daemon still runs, with an RMS energy gate in front of whisper instead
+of the model.
 
 ## 4. Configure
 
@@ -78,12 +81,14 @@ Every key is described in [configuration.md](configuration.md).
 parlad --check
 ```
 
-resolves both model paths, parses the dictionary, snippets and app profiles,
+resolves the model paths, loads the VAD model and says which gate is active,
+parses the dictionary, snippets and app profiles,
 parses both hotkey chords, lists input devices, probes the injectors and
 says which one is active, counts visible windows and virtual desktops,
 resolves one `.desktop` lookup, reports whether the session is locked and
 whether a daemon already owns the bus name. It registers no hotkeys, loads
-no model and types nothing, so it is safe on a live session.
+no model beyond the small VAD and types nothing, so it is safe on a live
+session.
 
 Two more read-only commands are worth knowing before the first real
 utterance:
@@ -164,8 +169,10 @@ KWin that exposes the interface; on failure `ydotool` is tried, which needs
 the focused window and reports the injector's error directly.
 
 **Whisper writes "Thank you." on silence.** That is the hallucination the
-blocklist and the energy gate exist for. Raise `audio.speech_threshold` a
-little if the room is noisy.
+blocklist and the speech gate exist for. Check `parlad --check` says `vad:
+silero`; without the model file the RMS gate is in use, and noise can pass
+it. With Silero, raise `audio.vad_threshold` a little if the room is noisy;
+with the energy gate, `audio.speech_threshold`.
 
 **A name keeps coming out wrong.** Add it to `words` in the dictionary, or
 to the Dictionary page. It primes whisper and instructs the cleanup model.

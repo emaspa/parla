@@ -287,7 +287,11 @@ pub struct AudioConfig {
     /// Input device name (cpal); None = system default. Capture runs at the
     /// device's own rate and is resampled to the 16 kHz whisper expects.
     pub device: Option<String>,
-    /// RMS energy gate: frames above this count as speech.
+    /// Silero VAD: a frame whose speech probability is at or above this
+    /// counts as speech. Used when `asr.vad_model_path` exists.
+    pub vad_threshold: f32,
+    /// RMS energy gate, the fallback without a VAD model: frames above this
+    /// count as speech.
     pub speech_threshold: f32,
     /// Hard cap on utterance length after silence trimming.
     pub max_utterance_ms: u64,
@@ -311,6 +315,9 @@ pub struct AudioConfig {
 pub struct AsrConfig {
     /// Path to the ggml model file.
     pub model_path: PathBuf,
+    /// Path to whisper.cpp's Silero VAD model. When the file is absent the
+    /// daemon starts anyway with the RMS energy gate in its place.
+    pub vad_model_path: PathBuf,
     /// Whisper language code, or "auto" to detect.
     pub language: String,
     pub threads: usize,
@@ -348,6 +355,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             device: None,
+            vad_threshold: 0.5,
             speech_threshold: 0.01,
             max_utterance_ms: 30_000,
             min_utterance_ms: 250,
@@ -362,6 +370,7 @@ impl Default for AsrConfig {
     fn default() -> Self {
         Self {
             model_path: dirs_model().join("ggml-large-v3-turbo.bin"),
+            vad_model_path: dirs_model().join("ggml-silero-v5.1.2.bin"),
             language: "en".into(),
             threads: 4,
             initial_prompt: None,
@@ -426,6 +435,7 @@ impl DaemonConfig {
             tracing::warn!("audio.end_silence_ms is ignored: the energy gate has no end-of-speech timeout");
         }
         check_unit("audio.speech_threshold", f64::from(a.speech_threshold))?;
+        check_unit("audio.vad_threshold", f64::from(a.vad_threshold))?;
         anyhow::ensure!(a.max_utterance_ms > 0, "audio.max_utterance_ms must be > 0");
         anyhow::ensure!(a.max_hold_ms > 0, "audio.max_hold_ms must be > 0");
         anyhow::ensure!(
@@ -533,6 +543,9 @@ mod tests {
         c.audio.speech_threshold = 1.5;
         assert!(c.validate().is_err());
         let mut c = DaemonConfig::default();
+        c.audio.vad_threshold = -0.1;
+        assert!(c.validate().is_err());
+        let mut c = DaemonConfig::default();
         c.judge.min_confidence = 0.9;
         c.judge.act_unconfirmed_above = 0.5;
         assert!(c.validate().is_err());
@@ -562,6 +575,19 @@ mod tests {
         assert!(!toml.contains("sk-live"), "{toml}");
         let parsed: TypeSafeConfig = toml::from_str("api_key = \"abc\"").unwrap();
         assert_eq!(parsed.api_key.as_ref().unwrap().expose(), "abc");
+    }
+
+    #[test]
+    fn default_toml_round_trips_with_vad_keys() {
+        let text = DaemonConfig::default_toml().unwrap();
+        assert!(text.contains("vad_model_path = "), "{text}");
+        assert!(text.contains("vad_threshold = 0.5"), "{text}");
+        let cfg: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.asr.vad_model_path, AsrConfig::default().vad_model_path);
+        assert_eq!(
+            cfg.asr.vad_model_path.file_name().unwrap(),
+            "ggml-silero-v5.1.2.bin"
+        );
     }
 
     #[test]

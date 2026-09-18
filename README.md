@@ -168,3 +168,8 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
 - **The daemon and the UI have run together only against the mock.** The
   bus contract is tested end to end, but the first real session with both
   is still ahead.
+
+## License
+
+MIT or Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

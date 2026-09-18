@@ -81,21 +81,27 @@ async fn main() -> anyhow::Result<()> {
                 if a11y.enabled_by_us() { "set by this probe" } else { "was already true" }
             );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let mut found = None;
-            loop {
-                match a11y.focused_text().await {
-                    Ok(Some(t)) => {
-                        found = Some(t);
-                        break;
+            let wait = async {
+                loop {
+                    match a11y.focused_text().await {
+                        Ok(Some(t)) => return Some(t),
+                        Ok(None) => {}
+                        Err(e) => println!("read failed: {e:#}"),
                     }
-                    Ok(None) => {}
-                    Err(e) => println!("read failed: {e:#}"),
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                if std::time::Instant::now() >= deadline {
-                    break;
+            };
+            // Ctrl-C while waiting must still put IsEnabled back.
+            let found = tokio::select! {
+                found = wait => found,
+                _ = tokio::signal::ctrl_c() => {
+                    println!("interrupted");
+                    None
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
+            };
             match found {
                 Some(t) => {
                     println!("app:     {}", t.app);

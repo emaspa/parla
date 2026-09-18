@@ -110,16 +110,6 @@ pub enum Verified {
     Fuzzy { deleted: usize },
 }
 
-impl Verified {
-    /// Characters deleted, given how many were typed.
-    pub fn deleted(self, typed: usize) -> usize {
-        match self {
-            Verified::Blind | Verified::Exact => typed,
-            Verified::Fuzzy { deleted } => deleted,
-        }
-    }
-}
-
 pub struct Executor {
     cfg: DesktopdConfig,
     injector: Arc<dyn TextInjector>,
@@ -150,10 +140,6 @@ impl Executor {
     pub fn with_a11y(mut self, a11y: Option<Arc<A11y>>) -> Self {
         self.a11y = a11y;
         self
-    }
-
-    pub fn a11y(&self) -> Option<&Arc<A11y>> {
-        self.a11y.as_ref()
     }
 
     pub fn injector_name(&self) -> &'static str {

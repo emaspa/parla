@@ -143,16 +143,6 @@ impl JudgeConfig {
                 .unwrap_or(d.destructive_threshold),
         }
     }
-
-    /// Write the resolved thresholds into the optional keys, so a printed
-    /// config shows the numbers in force instead of omitting them.
-    fn fill_thresholds(&mut self) {
-        let t = self.thresholds();
-        self.min_confidence = Some(t.min_confidence);
-        self.act_unconfirmed_above = Some(t.act_unconfirmed_above);
-        self.dictation_threshold = Some(t.dictation_threshold);
-        self.destructive_threshold = Some(t.destructive_threshold);
-    }
 }
 
 impl std::fmt::Display for Backend {
@@ -611,12 +601,35 @@ impl DaemonConfig {
     }
 
     /// Emit the default config file (parlad --print-default-config). The
-    /// judge thresholds are printed resolved for the default backend, so
-    /// the file documents the numbers in force.
+    /// judge thresholds are printed commented out, with the numbers for
+    /// both backends alongside: a key that is written stays in force when
+    /// `backend` changes, one that is not follows the backend.
     pub fn default_toml() -> anyhow::Result<String> {
-        let mut cfg = Self::default();
-        cfg.judge.fill_thresholds();
-        Ok(toml::to_string_pretty(&cfg)?)
+        let text = toml::to_string_pretty(&Self::default())?;
+        let (l, t) = (LOCAL_THRESHOLDS, TYPESAFE_THRESHOLDS);
+        let thresholds = format!(
+            "# Defaults depend on the backend: local {}/{}/{}/{}, typesafe {}/{}/{}/{}; \
+set a key to override.\n\
+# min_confidence = {}\n# act_unconfirmed_above = {}\n# dictation_threshold = {}\n\
+# destructive_threshold = {}\nsend_window_titles = ",
+            l.min_confidence,
+            l.act_unconfirmed_above,
+            l.dictation_threshold,
+            l.destructive_threshold,
+            t.min_confidence,
+            t.act_unconfirmed_above,
+            t.dictation_threshold,
+            t.destructive_threshold,
+            l.min_confidence,
+            l.act_unconfirmed_above,
+            l.dictation_threshold,
+            l.destructive_threshold,
+        );
+        anyhow::ensure!(
+            text.matches("send_window_titles = ").count() == 1,
+            "default config has no single [judge] send_window_titles key"
+        );
+        Ok(text.replacen("send_window_titles = ", &thresholds, 1))
     }
 }
 
@@ -694,20 +707,25 @@ mod tests {
         assert_eq!(t.min_confidence, 0.3);
         assert_eq!(t.dictation_threshold, TYPESAFE_THRESHOLDS.dictation_threshold);
 
-        // The printed defaults carry all four keys under their old names,
-        // with the local numbers, and load back under deny_unknown_fields.
+        // The printed defaults show all four keys commented out, with the
+        // local numbers, under [judge] and before send_window_titles, and
+        // load back with no key set, so the backend's table applies.
         let text = DaemonConfig::default_toml().unwrap();
+        let judge = text.find("[judge]").unwrap();
         for key in [
-            "min_confidence = ",
-            "act_unconfirmed_above = ",
-            "dictation_threshold = ",
-            "destructive_threshold = ",
+            "\n# min_confidence = 0.35\n",
+            "\n# act_unconfirmed_above = 0.65\n",
+            "\n# dictation_threshold = 0.4\n",
+            "\n# destructive_threshold = 0.8\n",
+            "typesafe 0.45/0.75/0.5/0.6",
         ] {
-            assert!(text.contains(key), "{text}");
+            let at = text.find(key).unwrap_or_else(|| panic!("{key:?} missing from\n{text}"));
+            assert!(at > judge && at < text.find("send_window_titles").unwrap(), "{text}");
         }
+        assert!(!text.contains("\nmin_confidence = "), "{text}");
         let back: DaemonConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.judge.thresholds(), LOCAL_THRESHOLDS);
-        assert_eq!(back.judge.min_confidence, Some(LOCAL_THRESHOLDS.min_confidence));
+        assert_eq!(back.judge.min_confidence, None);
         back.validate().unwrap();
     }
 

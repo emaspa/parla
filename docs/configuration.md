@@ -198,10 +198,11 @@ list of options.
 enabled = true
 backend = "local"
 timeout_ms = 4000
-min_confidence = 0.35
-act_unconfirmed_above = 0.65
-dictation_threshold = 0.4
-destructive_threshold = 0.8
+# Defaults depend on the backend: local 0.35/0.65/0.4/0.8, typesafe 0.45/0.75/0.5/0.6; set a key to override.
+# min_confidence = 0.35
+# act_unconfirmed_above = 0.65
+# dictation_threshold = 0.4
+# destructive_threshold = 0.8
 send_window_titles = false
 
 [judge.typesafe]
@@ -235,9 +236,9 @@ The local numbers come from `parlad --calibrate` over the corpus in
 `corpus/judge.toml`. The method and the results are in
 [commands.md](commands.md). The TypeSafe numbers were picked by hand for
 that API's calibrated outputs and have not been run against the corpus.
-`--print-default-config` prints the four keys with the local values,
-since `local` is the default backend, and `--check` prints the values in
-force.
+`--print-default-config` prints the four keys commented out, with the
+local values, so a file that only changes `backend` follows the new
+backend's numbers; `--check` prints the values in force.
 
 `send_window_titles` only affects the `typesafe` backend. By default the
 request names each open window by its application class and an index, and
@@ -292,13 +293,15 @@ pages stay empty and nothing about what was said is written to disk.
 that shorter" still refer to it. The reference also dies when focus moves
 to another window.
 
-`context` reads the focused text field over the accessibility bus when the
-dictation hotkey goes down and tells the cleanup model what is before the
-cursor, so the dictation continues it in the same language, register and
-capitalisation, and gets a leading space when it needs one. It needs
-`desktopd.a11y`. Nothing is read from a password field, and profiles with
-the code tone get the leading-space rule only. With the OpenAI backend the
-text before the cursor is sent with the transcript. The details are in
+`context` tells the cleanup model what is before the cursor, when the
+focused text field could be read over the accessibility bus as the
+dictation hotkey went down, so the dictation continues it in the same
+language, register and capitalisation. It needs `desktopd.a11y`. Nothing
+is read from a password field, and profiles with the code tone do not show
+the model the field. The spaces the text needs so it does not run into
+the words around the cursor are added whenever the field could be read,
+with `context` on or off. With the OpenAI backend the text before the
+cursor is sent with the transcript. The details are in
 [dictation.md](dictation.md).
 
 `learn` is what happens when a word is changed by hand right after a

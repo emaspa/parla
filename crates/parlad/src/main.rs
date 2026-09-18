@@ -256,6 +256,7 @@ async fn serve(
         judge,
         Arc::clone(&flow),
         Duration::from_millis(cfg.router.confirm_window_ms),
+        cfg.router.notify_results,
         bus.clone(),
     ));
 
@@ -864,6 +865,7 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
         Some(Arc::clone(&judge)),
         flow,
         Duration::from_millis(cfg.router.confirm_window_ms),
+        cfg.router.notify_results,
         None,
     );
     let mut snapshot = router.snapshot(None).await?;
@@ -960,9 +962,16 @@ async fn flow_once(text: &str, instruction: Option<&str>, class: &str) -> anyhow
                     app: "an application".into(),
                     role: "text field".into(),
                     before,
+                    after: String::new(),
                 });
             match &context {
-                Some(c) => println!("context:    before the cursor {:?}", c.before),
+                Some(c) if flow.context_enabled() => {
+                    println!("context:    before the cursor {:?}", c.before)
+                }
+                Some(c) => println!(
+                    "context:    before the cursor {:?} (flow.context is off: spacing only)",
+                    c.before
+                ),
                 None => println!("context:    none (set PARLA_CONTEXT_BEFORE to try one)"),
             }
             let out = flow.process(text, class, context.as_ref()).await;

@@ -31,8 +31,12 @@ back, and what parla learns from corrections.
 7. If the field was read, a space goes in front of the text when the
    character before the cursor is not whitespace, a line break, an opening
    bracket or a quote, and the text does not itself start with whitespace
-   or punctuation. With the code tone, no space follows any other symbol
-   either, so a path stays one path.
+   or punctuation. A space goes after it by the same rule turned around:
+   when the text after the cursor starts with a letter or digit and the
+   text does not end with whitespace, an opening bracket or a quote. With
+   the code tone, no space follows any other symbol either, so a path
+   stays one path. This holds with `flow.context` off too, and for a
+   snippet.
 8. The text is typed, and a history record is written.
 
 Everything in this file is exercised without a microphone or a focused
@@ -222,8 +226,8 @@ not repeat any of it.
 quoting the last 300 characters. An empty field is described as empty.
 The section comes last in the prompt so the local model's KV cache keeps
 the part that never changes. Profiles with the code tone skip it: a
-terminal's screen is not prose to continue, and the leading-space rule is
-all that applies there. The output check in step 5 still runs, so a model
+terminal's screen is not prose to continue, and the spacing rule is all
+that applies there. The output check in step 5 still runs, so a model
 that answers the context instead of cleaning the transcript is caught by
 the length limit.
 
@@ -274,8 +278,9 @@ is a question or not about the text, output the text unchanged. The
 dictionary's words are included, and the code tone adds "keep it literal".
 parla takes back the old text with the same verification as "scratch
 that" and types the new; a field that no longer ends with the dictation
-refuses the edit. An edit that fails is reported and nothing is typed. Edits never ask for confirmation: the text
-is the user's own words of a moment ago, and can be dictated again.
+refuses the edit. An edit that fails is reported and nothing is typed.
+Edits never ask for confirmation: the text is the user's own words of a
+moment ago, and can be dictated again.
 
 ```
 parlad --edit "send it tuesday" "make that more formal" org.kde.thunderbird
@@ -293,16 +298,20 @@ dictionary entry that would have prevented it. When the focused field
 could be read at capture start, parlad reads it again after the
 dictation and compares.
 
-What is compared is the region the dictation occupies: up to 20
+What is compared is the region the dictation occupies: about 20
 characters of what was already before the cursor, the text parla typed,
-and up to 20 characters of what followed. The context is there to anchor
-the comparison. `flow.learn_after_ms` after typing (20 seconds by
-default), or when the next dictation starts if that comes first, parlad
-reads the same character range back, with 40 characters of slack at the
-end for words added after it. It splits both texts into words, aligns
-them on their longest common subsequence, and where a run of words was
-replaced by a run of the same length, pairs the words up in order. A pair
-is a correction when
+and about 20 characters of what followed. Each edge is moved to the
+nearest whitespace, so the context begins and ends with whole words. The
+context is there to anchor the comparison. `flow.learn_after_ms` after
+typing (20 seconds by default), or when the next dictation starts if that
+comes first, parlad reads the same character range back, with 40
+characters of slack at the end for words added after it. It splits both
+texts into words, aligns them on their longest common subsequence, and
+where a run of words was replaced by a run of the same length, pairs the
+words up in order. The first or last word of the read is left out of a
+pair when it is the tail or head of the word it stands against: text
+edited earlier in the field shifts the region, and the read then starts
+or ends inside a word. A pair is a correction when
 
 - both words are letters, apostrophes and hyphens only, so numbers, paths
   and symbols never count;
@@ -317,7 +326,9 @@ was scratched, rewritten by a voice edit, or typed into a field that
 cannot be read any more, and a password field is never read. A pair the
 dictionary already produces (the written form is one of the words, or a
 replacement exists for the heard word) is skipped, and so is one you
-dismissed.
+dismissed. The check runs against the dictionary as it is on disk when
+the file is written, so a suggestion the UI just accepted does not come
+back.
 
 What survives goes into `~/.local/share/parla/learned.toml`:
 
@@ -343,9 +354,9 @@ file is all that changes, and the UI's Dictionary page lists the pairs
 with Accept and Dismiss. Accept puts the written form into `words` and
 the pair into `replace`, saves the dictionary, and asks the daemon to
 reload. With `auto`, the daemon moves a pair seen twice into the dictionary the
-same way, reloads the files, and sends a notification saying "Learned:
-Emanuel -> Emanuele". With `off`, nothing is
-read back. Learning needs `desktopd.a11y`; it works with `flow.context`
+same way, reloads the files, and, with `router.notify_results` on, sends
+a notification saying "Learned: Emanuel -> Emanuele". With `off`, nothing
+is read back. Learning needs `desktopd.a11y`; it works with `flow.context`
 off, since the field is read either way.
 
 ## History

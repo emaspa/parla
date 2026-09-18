@@ -87,8 +87,12 @@ struct LastDictation {
 }
 
 /// Characters of context kept on either side of a dictation, so the
-/// comparison has anchors that were not dictated.
+/// comparison has anchors that were not dictated. The edge is moved to
+/// the nearest whitespace, so the context never starts or ends inside a
+/// word; see [`context_len`].
 const LEARN_CONTEXT: usize = 20;
+/// Furthest an edge is moved out to reach whitespace.
+const LEARN_CONTEXT_MAX: usize = 40;
 /// Extra characters read past the region, so a word the user added at the
 /// end does not shift the context out of the read.
 const LEARN_SLACK: i32 = 40;
@@ -119,6 +123,8 @@ pub struct Router {
     seq: AtomicU64,
     /// How long a confirmation prompt stays answerable.
     confirm_window: Duration,
+    /// `router.notify_results`: whether a learned pair is announced.
+    notify_results: bool,
     bus: Option<Bus>,
 }
 
@@ -132,6 +138,7 @@ impl Router {
         judge: Option<Arc<Judge>>,
         flow: Arc<Flow>,
         confirm_window: Duration,
+        notify_results: bool,
         bus: Option<Bus>,
     ) -> Self {
         let policy = judge
@@ -147,6 +154,7 @@ impl Router {
             last: Arc::new(Mutex::new(None)),
             seq: AtomicU64::new(0),
             confirm_window,
+            notify_results,
             bus,
         }
     }
@@ -194,7 +202,9 @@ impl Router {
     ) -> anyhow::Result<Handled> {
         let class = focused.map(|w| w.class.as_str()).unwrap_or_default();
         // A correction pass still waiting for the previous dictation runs
-        // now, before this one changes the field.
+        // now, on its own task so it costs this one nothing. It reads the
+        // field before this dictation is typed; what this one adds past
+        // the region would be an insertion, which the comparison ignores.
         let pending = self
             .last
             .lock()
@@ -202,11 +212,13 @@ impl Router {
             .as_mut()
             .and_then(|l| l.learn.take());
         if let Some(learn) = pending {
-            learn_from(&self.flow, learn).await;
+            let flow = Arc::clone(&self.flow);
+            let notify = self.notify_results;
+            tokio::spawn(async move { learn_from(&flow, learn, notify).await });
         }
-        let context = field
-            .filter(|_| self.flow.context_enabled())
-            .and_then(TextContext::from_focused);
+        // The field is read whenever it can be, for the spacing rule; the
+        // flow decides whether the model gets to see it.
+        let context = field.and_then(TextContext::from_focused);
         if let Some(c) = &context {
             tracing::debug!(
                 "dictating into {} ({}), {} chars before the cursor",
@@ -239,6 +251,7 @@ impl Router {
             let last = Arc::clone(&self.last);
             let flow = Arc::clone(&self.flow);
             let after = self.flow.learn_after();
+            let notify = self.notify_results;
             tokio::spawn(async move {
                 tokio::time::sleep(after).await;
                 // Gone if the dictation was scratched, edited or followed
@@ -250,11 +263,25 @@ impl Router {
                     .filter(|l| l.seq == seq)
                     .and_then(|l| l.learn.take());
                 if let Some(learn) = learn {
-                    learn_from(&flow, learn).await;
+                    learn_from(&flow, learn, notify).await;
                 }
             });
         }
         Ok(Handled::Typed(processed))
+    }
+
+    /// Forget the correction pass of the last dictation: its text is about
+    /// to be deleted, and a pass that fired while it is being retyped
+    /// would take parla's own rewrite for a hand correction.
+    fn disarm_learn(&self) {
+        if let Some(last) = self
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            last.learn = None;
+        }
     }
 
     /// The last dictation, if it is recent and the focus has not moved.
@@ -389,6 +416,7 @@ impl Router {
         let last = self
             .recent_dictation(focused)
             .ok_or_else(|| anyhow::anyhow!("nothing recent to take back"))?;
+        self.disarm_learn();
         self.progress(State::Typing, Mode::Command);
         let typed = last.text.chars().count();
         let verified = self.executor.verified_backspace(&last.text).await?;
@@ -420,6 +448,7 @@ impl Router {
         if text == last.text {
             return Ok(Handled::Done("nothing to change".into()));
         }
+        self.disarm_learn();
         self.progress(State::Typing, Mode::Command);
         let typed = last.text.chars().count();
         let verified = self.executor.verified_backspace(&last.text).await?;
@@ -513,16 +542,17 @@ impl Router {
     }
 }
 
-/// Where the dictation sits in the field once typed, with up to
+/// Where the dictation sits in the field once typed, with about
 /// [`LEARN_CONTEXT`] characters of what was already there on either side.
 /// The caret after typing is read back when the application has processed
 /// the keystrokes by then, and computed from the text otherwise.
 async fn learn_region(field: &FocusedText, typed: &str) -> Learn {
-    let before: Vec<char> = field.before.chars().collect();
-    let k = before.len().min(LEARN_CONTEXT);
-    let before_tail: String = before[before.len() - k..].iter().collect();
-    let after_head: String = field.after.chars().take(LEARN_CONTEXT).collect();
-    let m = after_head.chars().count();
+    let before: Vec<char> = field.before.chars().rev().collect();
+    let k = context_len(&before);
+    let before_tail: String = before[..k].iter().rev().collect();
+    let after: Vec<char> = field.after.chars().collect();
+    let m = context_len(&after);
+    let after_head: String = after[..m].iter().collect();
     let computed = field.caret + typed.chars().count() as i32;
     let caret_after = match field.handle.caret().await {
         Ok(c) if c >= computed => c,
@@ -537,9 +567,27 @@ async fn learn_region(field: &FocusedText, typed: &str) -> Learn {
     }
 }
 
+/// How many of `chars`, counted from the dictation outwards, to keep as
+/// context: [`LEARN_CONTEXT`], moved to the nearest place where the
+/// context starts at a word (the text's end, or whitespace on either side
+/// of the cut), no further out than [`LEARN_CONTEXT_MAX`]. A context that
+/// started inside a word would leave a fragment to be paired with the
+/// whole word once the text shifts.
+fn context_len(chars: &[char]) -> usize {
+    let n = chars.len();
+    let boundary =
+        |k: usize| k == 0 || k == n || chars[k - 1].is_whitespace() || chars[k].is_whitespace();
+    let k = LEARN_CONTEXT.min(n);
+    let inner = (0..=k).rev().find(|&k| boundary(k)).unwrap_or(0);
+    match (k..=LEARN_CONTEXT_MAX.min(n)).find(|&k| boundary(k)) {
+        Some(outer) if outer - k <= k - inner => outer,
+        _ => inner,
+    }
+}
+
 /// Read the region again, compare, and hand what changed to the flow. A
 /// field that can no longer be read is logged and forgotten.
-async fn learn_from(flow: &Flow, learn: Learn) {
+async fn learn_from(flow: &Flow, learn: Learn, notify: bool) {
     let now = match learn.handle.read(learn.from, learn.to + LEARN_SLACK).await {
         Ok(t) => t,
         Err(e) => {
@@ -574,7 +622,7 @@ async fn learn_from(flow: &Flow, learn: Learn) {
         .filter(|l| l.promoted)
         .map(|l| format!("{} -> {}", l.heard, l.written))
         .collect();
-    if !promoted.is_empty() {
+    if notify && !promoted.is_empty() {
         let body = format!("Learned: {}", promoted.join(", "));
         if let Err(e) = desktopd::notify::notify("parla", &body).await {
             tracing::debug!("notification failed: {e}");
@@ -598,5 +646,49 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn before_context(s: &str) -> String {
+        let chars: Vec<char> = s.chars().rev().collect();
+        chars[..context_len(&chars)].iter().rev().collect()
+    }
+
+    fn after_context(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        chars[..context_len(&chars)].iter().collect()
+    }
+
+    #[test]
+    fn context_edges_sit_on_whitespace() {
+        // 20 characters back would start inside "three"; the nearest
+        // boundary is one character further out.
+        assert_eq!(
+            before_context("one two three four five sixes"),
+            "three four five sixes"
+        );
+        assert_eq!(
+            after_context("sixes five four three two one"),
+            "sixes five four three"
+        );
+        // already on a boundary: exactly 20
+        assert_eq!(
+            before_context("one two three four five six"),
+            " three four five six"
+        );
+        // the nearest boundary is inwards
+        assert_eq!(
+            before_context("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx yz"),
+            " yz"
+        );
+        // short text is taken whole; a word too long to find a boundary
+        // in gives no context rather than a fragment
+        assert_eq!(before_context("hi there"), "hi there");
+        assert_eq!(before_context(&"x".repeat(50)), "");
+        assert_eq!(after_context(""), "");
     }
 }

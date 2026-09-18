@@ -238,6 +238,12 @@ pub fn add_to_dictionary(dictionary: &mut Dictionary, r: Replacement) {
 /// apostrophes and hyphens), differ, and are equal ignoring case and
 /// diacritics or within [`MAX_DISTANCE`] edits of each other. Inserted and
 /// deleted words are ignored.
+///
+/// `typed` starts and ends on word boundaries; `now` is a raw read of the
+/// same character range and can start or end inside a word, when text
+/// before the region was edited or the read ran out. A first or last word
+/// of `now` that is the tail or head of the word it stands against is
+/// such a fragment, not a spelling.
 pub fn corrections(typed: &str, now: &str) -> Vec<(String, String)> {
     let a = words(typed);
     let b = words(now);
@@ -248,6 +254,9 @@ pub fn corrections(typed: &str, now: &str) -> Vec<(String, String)> {
         if i - ai == j - bi {
             for k in 0..i - ai {
                 let (x, y) = (a[ai + k], b[bi + k]);
+                if fragment(x, y, bi + k == 0, bi + k + 1 == b.len()) {
+                    continue;
+                }
                 if spelling_pair(x, y) {
                     out.push((x.to_string(), y.to_string()));
                 }
@@ -257,6 +266,14 @@ pub fn corrections(typed: &str, now: &str) -> Vec<(String, String)> {
         bi = j + 1;
     }
     out
+}
+
+/// Whether `now`, read back where `typed` stood, is a piece of it cut at
+/// the edge of the read: the first word of the read and a proper suffix
+/// of `typed`, or the last and a proper prefix.
+fn fragment(typed: &str, now: &str, first: bool, last: bool) -> bool {
+    let (t, n) = (typed.to_lowercase(), now.to_lowercase());
+    n.len() < t.len() && ((first && t.ends_with(&n)) || (last && t.starts_with(&n)))
 }
 
 /// Whitespace-separated tokens with surrounding punctuation stripped.
@@ -422,6 +439,28 @@ mod tests {
             pairs("Dear Emanuel, thanks", "Dear Emanuele, thanks for the"),
             vec![pair("Emanuel", "Emanuele")]
         );
+    }
+
+    #[test]
+    fn a_fragment_at_the_edge_of_the_read_is_not_a_correction() {
+        // text inserted before the region shifted the read into a word
+        assert_eq!(pairs("world is fine", "orld is fine"), vec![]);
+        // the read ran out inside the last word
+        assert_eq!(pairs("it is fine", "it is fin"), vec![]);
+        assert_eq!(
+            pairs("Dear Emanuel, fine", "Dear Emanuele, fin"),
+            vec![pair("Emanuel", "Emanuele")]
+        );
+        // a whole word at the edge still counts, longer or not
+        assert_eq!(
+            pairs("Hi Emanuel", "Hi Emanuele"),
+            vec![pair("Emanuel", "Emanuele")]
+        );
+        assert_eq!(
+            pairs("Emanuele is", "Emanuel is"),
+            vec![pair("Emanuele", "Emanuel")]
+        );
+        assert_eq!(pairs("parla is", "Parla is"), vec![pair("parla", "Parla")]);
     }
 
     #[test]

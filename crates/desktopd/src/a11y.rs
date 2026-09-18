@@ -105,11 +105,6 @@ impl TextHandle {
         bounded("caret offset", text.caret_offset()).await
     }
 
-    /// How long the field is now, in characters.
-    pub async fn length(&self) -> anyhow::Result<i32> {
-        let text = self.text().await?;
-        bounded("character count", text.character_count()).await
-    }
 }
 
 /// What the follower remembers about the focused object.
@@ -143,9 +138,27 @@ impl A11y {
             bounded("set IsEnabled", status.set_is_enabled(true)).await?;
             enabled_by_us = true;
         }
+        let connected = Self::open(&session, was_enabled, enabled_by_us).await;
+        if connected.is_err() && enabled_by_us {
+            // Nothing will call `shutdown` for a connection that never
+            // came to be; do not leave the flag on for it.
+            match bounded("clear IsEnabled", status.set_is_enabled(false)).await {
+                Ok(()) => tracing::info!("a11y: IsEnabled restored to false"),
+                Err(e) => tracing::warn!("a11y: could not restore IsEnabled: {e:#}"),
+            }
+        }
+        connected
+    }
+
+    /// The part of [`A11y::connect`] after `IsEnabled` is settled.
+    async fn open(
+        session: &zbus::Connection,
+        was_enabled: bool,
+        enabled_by_us: bool,
+    ) -> anyhow::Result<Self> {
         let address = bounded(
             "a11y bus address",
-            BusProxy::new(&session).await?.get_address(),
+            BusProxy::new(session).await?.get_address(),
         )
         .await?;
         let conn = tokio::time::timeout(

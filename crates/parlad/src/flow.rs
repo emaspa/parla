@@ -54,8 +54,9 @@ translate, or add anything that was not said.
 /// How much of the text before the cursor the model is shown.
 const CONTEXT_CHARS: usize = 300;
 
-/// The text field a dictation lands in, as far as the cleanup model is
-/// told: where the cursor is and what comes before it.
+/// The text field a dictation lands in: where the cursor is and what is
+/// around it. The cleanup model is told what comes before the cursor;
+/// what comes after only decides whether the text needs a space at its end.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextContext {
     /// The application's name, as its toolkit reports it.
@@ -64,12 +65,14 @@ pub struct TextContext {
     pub role: String,
     /// The text before the cursor, as much of it as was read.
     pub before: String,
+    /// The text after the cursor, as much of it as was read.
+    pub after: String,
 }
 
 impl TextContext {
     /// A context for a field, or None for a password field: what is in
     /// one never reaches a prompt.
-    pub fn new(app: &str, role: &str, password: bool, before: &str) -> Option<Self> {
+    pub fn new(app: &str, role: &str, password: bool, before: &str, after: &str) -> Option<Self> {
         if password {
             return None;
         }
@@ -77,12 +80,13 @@ impl TextContext {
             app: app.to_string(),
             role: role.to_string(),
             before: before.to_string(),
+            after: after.to_string(),
         })
     }
 
     /// From a field read over AT-SPI.
     pub fn from_focused(t: &desktopd::FocusedText) -> Option<Self> {
-        Self::new(&t.app, &t.role, t.password, &t.before)
+        Self::new(&t.app, &t.role, t.password, &t.before, &t.after)
     }
 }
 
@@ -275,6 +279,14 @@ impl Flow {
         let path = paths::learned();
         let mut suggestions = Suggestions::load(&path)?;
         let mut dictionary = Dictionary::load(&paths::dictionary())?;
+        // A pair the dictionary produces by now (the UI accepted it, or
+        // the user wrote the word in by hand) has no business staying on
+        // the list, or coming back with the save below.
+        let before = suggestions.suggestions.len();
+        suggestions
+            .suggestions
+            .retain(|s| !learned::covered(&dictionary, &s.heard, &s.written));
+        let pruned = suggestions.suggestions.len() < before;
         let mut out = Vec::new();
         let mut promoted = false;
         for (heard, written) in pairs {
@@ -302,7 +314,7 @@ impl Flow {
             }
             out.push(l);
         }
-        if out.is_empty() {
+        if out.is_empty() && !pruned {
             return Ok(out);
         }
         suggestions.save(&path)?;
@@ -334,22 +346,22 @@ impl Flow {
     }
 
     /// Turn a transcript into what gets typed into a window of `class`.
-    /// With `context`, the model is told what is before the cursor (not
-    /// for the code tone: a terminal's screen is not prose to continue),
-    /// and the result gets a leading space when it would otherwise run
-    /// into the word before the cursor.
+    /// With `flow.context` on, the model is told what is before the cursor
+    /// (not for the code tone: a terminal's screen is not prose to
+    /// continue). Whenever the field could be read, the result gets a
+    /// space at either end where it would otherwise run into the word
+    /// before or after the cursor; a snippet as much as any text.
     pub async fn process(
         &self,
         transcript: &str,
         class: &str,
         context: Option<&TextContext>,
     ) -> Processed {
-        let mut out = self.process_inner(transcript, class, context).await;
+        let seen = context.filter(|_| self.context);
+        let mut out = self.process_inner(transcript, class, seen).await;
         if let Some(ctx) = context {
             let code = self.profile_for(class).tone == parla_flow::Tone::Code;
-            if out.outcome != "snippet" && needs_space(&ctx.before, &out.text, code) {
-                out.text.insert(0, ' ');
-            }
+            out.text = spaced(out.text, &ctx.before, &ctx.after, code);
         }
         out
     }
@@ -548,6 +560,19 @@ fn last_chars(s: &str, n: usize) -> String {
     s.chars().skip(count.saturating_sub(n)).collect()
 }
 
+/// `text` with the spaces it needs to sit between `before` and `after`
+/// without running into either; see [`needs_space`], which is applied at
+/// both ends (the text is what is "before" the text after the cursor).
+fn spaced(mut text: String, before: &str, after: &str, code: bool) -> String {
+    if needs_space(before, &text, code) {
+        text.insert(0, ' ');
+    }
+    if needs_space(&text, after, code) {
+        text.push(' ');
+    }
+    text
+}
+
 /// Whether `text`, typed at the cursor, needs a space first so it does not
 /// run into what is there. No space after whitespace, a line break, an
 /// opening bracket or quote, or into an empty field, and none when the
@@ -711,6 +736,7 @@ mod tests {
             app: "Thunderbird".into(),
             role: "entry".into(),
             before: "Hi Alan,\n\nthanks for the".into(),
+            after: String::new(),
         };
         let s = cleanup_prompt(&AppProfile::fallback(), &["KWin".into()], Some(&ctx));
         assert!(s.contains("Spell these"));
@@ -744,11 +770,12 @@ mod tests {
     #[test]
     fn password_fields_give_no_context() {
         assert_eq!(
-            TextContext::new("Firefox", "password text", true, "hunter2"),
+            TextContext::new("Firefox", "password text", true, "hunter2", ""),
             None
         );
-        let ctx = TextContext::new("Firefox", "entry", false, "hello").unwrap();
+        let ctx = TextContext::new("Firefox", "entry", false, "hello", "there").unwrap();
         assert_eq!(ctx.before, "hello");
+        assert_eq!(ctx.after, "there");
     }
 
     #[test]
@@ -769,5 +796,23 @@ mod tests {
         assert!(!needs_space("git commit -m \"", "fix", true));
         assert!(needs_space("ls;", "cd parla", true));
         assert!(needs_space("a/", "b", false));
+    }
+
+    #[test]
+    fn spaces_go_where_the_text_would_run_into_a_word() {
+        assert_eq!(spaced("new".into(), "Hello ", "world", false), "new ");
+        assert_eq!(spaced("new".into(), "Hello", "world", false), " new ");
+        assert_eq!(spaced("new".into(), "Hello ", "", false), "new");
+        assert_eq!(spaced("new".into(), "Hello ", ", world", false), "new");
+        assert_eq!(spaced("new".into(), "Hello ", "\nworld", false), "new");
+        assert_eq!(spaced("new ".into(), "Hello ", "world", false), "new ");
+        assert_eq!(spaced("say \"".into(), "", "hello", false), "say \"");
+        // code: the same symmetry as in front
+        assert_eq!(
+            spaced("crates/".into(), "cd ~/parla/", "flow", true),
+            "crates/"
+        );
+        assert_eq!(spaced("cd parla".into(), "", "; ls", true), "cd parla");
+        assert_eq!(spaced("ls".into(), "", "-la", true), "ls");
     }
 }

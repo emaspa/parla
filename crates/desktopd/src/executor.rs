@@ -230,6 +230,11 @@ impl Executor {
         self.windows.list().await
     }
 
+    /// The window that has focus, or None when none does.
+    pub async fn active_window(&self) -> anyhow::Result<Option<Window>> {
+        self.windows.active().await
+    }
+
     /// The .desktop index, for callers that need to offer candidates rather
     /// than resolve a single query.
     pub fn desktop_index(&self) -> &DesktopIndex {
@@ -385,6 +390,24 @@ impl Executor {
             .await
             .map_err(|e| anyhow::anyhow!("injection task panicked: {e}"))??;
         Ok(format!("typed {n} chars via {name}"))
+    }
+
+    /// Delete `n` characters before the cursor in the focused window, as
+    /// `n` Backspace presses. Used to take back or replace a dictation.
+    pub async fn backspace(&self, n: usize) -> anyhow::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let injector = Arc::clone(&self.injector);
+        spawn_blocking(move || {
+            for _ in 0..n {
+                injector.key_chord("backspace")?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("injection task panicked: {e}"))??;
+        Ok(())
     }
 
     /// Send a key chord ("ctrl+s", "enter") to the focused window.

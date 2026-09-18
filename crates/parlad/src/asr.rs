@@ -55,10 +55,12 @@ impl Asr {
         })
     }
 
-    /// Transcribe mono 16 kHz f32 samples. Returns cleaned text; empty
+    /// Transcribe mono 16 kHz f32 samples. `prompt` primes the decoder with
+    /// vocabulary (the config's `asr.initial_prompt` plus the dictionary);
+    /// None uses the config's prompt alone. Returns cleaned text; empty
     /// string means "nothing worth transcribing" (silence hallucination or
     /// blank output).
-    pub fn transcribe(&self, samples: &[f32]) -> anyhow::Result<String> {
+    pub fn transcribe(&self, samples: &[f32], prompt: Option<&str>) -> anyhow::Result<String> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -71,7 +73,7 @@ impl Asr {
         } else {
             Some(&self.language)
         });
-        if let Some(prompt) = &self.initial_prompt {
+        if let Some(prompt) = prompt.or(self.initial_prompt.as_deref()) {
             params.set_initial_prompt(prompt);
         }
 

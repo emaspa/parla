@@ -3,9 +3,11 @@
 //! `Grammar::parse` matches literal word sequences, so it answers in
 //! microseconds and misses anything phrased differently ("bring up firefox",
 //! "kill that window"). Rather than hand those to a conversational agent, this
-//! asks one TypeSafe request for the intent *and* every argument that intent
-//! might need — the questions are independent and evaluated in parallel, so
-//! asking for arguments we will discard costs only their tokens.
+//! asks the model for the intent *and* every argument that intent might need
+//! in one evaluation — the questions are independent, so asking for
+//! arguments we will discard costs only their tokens. Which model answers is
+//! the [`Oracle`]'s business: a GGUF on this machine's GPU by default, or
+//! the TypeSafe API.
 //!
 //! Code still owns everything code is good at: which apps are installed, which
 //! windows are open, how many desktops exist, and what counts as confident
@@ -16,14 +18,17 @@
 //! and every returned choice is checked against what was offered.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use desktopd::DesktopIndex;
 use parla_grammar::Intent;
 use serde_json::json;
 
-use crate::config::TypeSafeConfig;
+use crate::config::{Backend, JudgeConfig};
+use crate::local::LocalModel;
+use crate::oracle::{Answer, NoulCriteria, Oracle, Question, Response, MAX_CHOICE_OPTIONS};
 use crate::policy::{Policy, Signals};
-use crate::typesafe::{Client, NoulCriteria, Question, Response, MAX_CHOICE_OPTIONS};
+use crate::typesafe::Client;
 use desktopd::windows::Window;
 
 /// Sentinel option names. Real candidates use `a:`/`w:`/`p:` keys, so these
@@ -88,9 +93,11 @@ pub enum Verdict {
 }
 
 pub struct Judge {
-    client: Client,
-    cfg: TypeSafeConfig,
+    oracle: Oracle,
     policy: Policy,
+    /// Whether window titles go into the questions. Always for a local
+    /// model; for the API only when the config allows them off the machine.
+    send_window_titles: bool,
 }
 
 /// Context code gathers before asking. Everything here is observed fact, kept
@@ -101,22 +108,38 @@ pub struct Context<'a> {
     pub current_desktop: u32,
     pub desktop_count: u32,
     pub claude_running: bool,
+    /// Something was dictated a moment ago, so "make that shorter" has a
+    /// referent and `edit_text` is on offer.
+    pub last_dictation: bool,
 }
 
 impl Judge {
-    pub fn new(cfg: TypeSafeConfig) -> anyhow::Result<Self> {
-        let key = cfg.resolved_api_key()?;
-        let client = Client::new(
-            key,
-            cfg.model.clone(),
-            std::time::Duration::from_millis(cfg.timeout_ms),
-        )?;
-        let policy = Policy::from(&cfg);
+    /// Build the backend the config names. `local` is the already-loaded
+    /// model when the config asks for one.
+    pub fn new(cfg: &JudgeConfig, local: Option<Arc<LocalModel>>) -> anyhow::Result<Self> {
+        let timeout = std::time::Duration::from_millis(cfg.timeout_ms);
+        let oracle = match cfg.backend {
+            Backend::Local => Oracle::Local(
+                local.ok_or_else(|| anyhow::anyhow!("judge.backend = \"local\" but no local model"))?,
+                timeout,
+            ),
+            Backend::TypeSafe => Oracle::TypeSafe(Client::new(
+                cfg.typesafe.resolved_api_key()?,
+                cfg.typesafe.model.clone(),
+                timeout,
+            )?),
+        };
+        let send_window_titles = oracle.is_local() || cfg.send_window_titles;
         Ok(Self {
-            client,
-            cfg,
-            policy,
+            oracle,
+            policy: Policy::from(cfg),
+            send_window_titles,
         })
+    }
+
+    /// The backend and model, for a log line.
+    pub fn describe(&self) -> String {
+        self.oracle.describe()
     }
 
     /// The thresholds this judge applies, so the router can gate the fast
@@ -126,11 +149,11 @@ impl Judge {
     }
 
     pub async fn judge_verdict(&self, utterance: &str, ctx: &Context<'_>) -> anyhow::Result<Verdict> {
-        let candidates = Candidates::build(utterance, ctx, &self.cfg);
+        let candidates = Candidates::build(utterance, ctx, self.send_window_titles);
         let state = candidates.state(utterance, ctx);
 
         let t0 = std::time::Instant::now();
-        let resp = self.client.evaluate(&state, &candidates.questions).await?;
+        let resp = self.oracle.evaluate(&state, &candidates.questions).await?;
         let (tokens_in, tokens_out) = resp
             .usage
             .as_ref()
@@ -140,6 +163,9 @@ impl Judge {
             utterance,
             t0.elapsed().as_secs_f64() * 1000.0,
         );
+        for (id, answer) in &resp.answers {
+            tracing::debug!("answer {id}: {}", candidates.describe(answer));
+        }
 
         Ok(compose(&resp, &self.policy, &candidates))
     }
@@ -268,6 +294,11 @@ fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict,
             let key = required(cand, resp, name, "payload", &mut confidence)?;
             args.insert("chord".into(), cand.span(key)?.replace(" plus ", " "));
         }
+        "edit_text" => {
+            // The whole utterance is the instruction; the model that
+            // applies it reads it as spoken.
+            args.insert("instruction".into(), cand.utterance.clone());
+        }
         "open_terminal" | "claude_read" => {}
         other => return Err(format!("no rule to build intent {other:?}")),
     }
@@ -317,6 +348,8 @@ struct AppCandidate {
 /// the questions built from them so answers can be checked against exactly
 /// what was sent.
 struct Candidates {
+    /// As spoken, for the intents that take the whole utterance.
+    utterance: String,
     /// Installed applications, keyed `a:<index>`.
     apps: Vec<AppCandidate>,
     /// Open windows, keyed `w:<index>`.
@@ -333,7 +366,7 @@ fn indexed(key: &str, prefix: &str) -> Option<usize> {
 }
 
 impl Candidates {
-    fn build(utterance: &str, ctx: &Context<'_>, cfg: &TypeSafeConfig) -> Self {
+    fn build(utterance: &str, ctx: &Context<'_>, send_window_titles: bool) -> Self {
         let mut seen = BTreeSet::new();
         let mut apps = Vec::new();
         for e in ctx.index.shortlist(utterance, APP_CANDIDATES) {
@@ -365,22 +398,27 @@ impl Candidates {
         let spans: Vec<String> = (0..starts).map(|i| words[i..].join(" ")).collect();
 
         Self::assemble(
+            utterance,
             apps,
             windows,
             spans,
             ctx.current_desktop,
             ctx.desktop_count,
-            cfg.send_window_titles,
+            send_window_titles,
+            ctx.last_dictation,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
+        utterance: &str,
         apps: Vec<AppCandidate>,
         windows: Vec<Window>,
         spans: Vec<String>,
         current_desktop: u32,
         desktop_count: u32,
         send_window_titles: bool,
+        last_dictation: bool,
     ) -> Self {
         let mut targets: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         for (i, app) in apps.iter().enumerate() {
@@ -429,6 +467,19 @@ impl Candidates {
             json!("`utterance` carries no such message"),
         );
 
+        let mut intents = intent_criteria();
+        if last_dictation {
+            intents.insert(
+                "edit_text".into(),
+                json!({
+                    "what": "Change the text the user dictated a moment ago: rewrite, shorten, expand, reformat, translate, fix, or change its tone",
+                    "examples": [
+                        "make that more formal", "shorter", "turn that into bullet points",
+                        "translate that to Italian", "capitalise the first word",
+                    ],
+                }),
+            );
+        }
         let mut q = BTreeMap::new();
         q.insert(
             "intent".into(),
@@ -437,7 +488,7 @@ impl Candidates {
                     "task": "The user spoke `utterance` to a voice assistant that drives a KDE Plasma desktop. Decide which single action they asked for.",
                     "note": "Use `open_windows` to tell a request to start something new from a request to switch to something already running.",
                 }),
-                criteria: intent_criteria(),
+                criteria: intents,
             },
         );
         q.insert(
@@ -521,6 +572,7 @@ impl Candidates {
             .all(|o| o.len() <= MAX_CHOICE_OPTIONS));
 
         Self {
+            utterance: utterance.to_string(),
             apps,
             windows,
             spans,
@@ -554,7 +606,45 @@ impl Candidates {
             "current_desktop": ctx.current_desktop,
             "desktop_count": ctx.desktop_count,
             "claude_code_session_running": ctx.claude_running,
+            "text_dictated_moments_ago": ctx.last_dictation,
         })
+    }
+
+    /// One answer as a log line: the chosen key with the human-readable
+    /// candidate it stands for, and the runner-up, so a threshold can be
+    /// judged against what the model actually weighed.
+    fn describe(&self, answer: &Answer) -> String {
+        match answer {
+            Answer::Noul { noul } => format!("{noul:.2}"),
+            Answer::Choice {
+                choice,
+                confidence,
+                probabilities,
+            } => {
+                let mut ranked: Vec<(&String, &f64)> = probabilities.iter().collect();
+                ranked.sort_by(|a, b| b.1.total_cmp(a.1));
+                let runner_up = ranked
+                    .iter()
+                    .find(|(k, _)| *k != choice)
+                    .map(|(k, p)| format!(", then {} {p:.2}", self.name_of(k)))
+                    .unwrap_or_default();
+                format!("{} {confidence:.2}{runner_up}", self.name_of(choice))
+            }
+            Answer::Score { score, confidence } => format!("{score:.2} ({confidence:.2})"),
+            Answer::Unknown => "unknown".into(),
+        }
+    }
+
+    /// The key plus what it denotes, for logs.
+    fn name_of(&self, key: &str) -> String {
+        match self.target(Some(key)) {
+            Target::App(app) => format!("{key} ({})", app.name),
+            Target::Window(w) => format!("{key} ({})", w.title),
+            _ => match self.span(key) {
+                Ok(s) => format!("{key} ({s:?})"),
+                Err(_) => key.to_string(),
+            },
+        }
     }
 
     /// Was `key` among the options we sent for choice question `id`?
@@ -745,6 +835,7 @@ mod tests {
     fn cand_with(apps: &[&str], windows: &[(&str, &str, &str)], desktops: u32, utterance: &str) -> Candidates {
         let words: Vec<&str> = utterance.split_whitespace().collect();
         Candidates::assemble(
+            utterance,
             apps.iter()
                 .map(|a| AppCandidate {
                     id: format!("{}.desktop", a.to_lowercase()),
@@ -757,6 +848,7 @@ mod tests {
             1,
             desktops,
             true,
+            false,
         )
     }
 
@@ -1183,13 +1275,10 @@ mod tests {
             current_desktop: 1,
             desktop_count: 1,
             claude_running: false,
+            last_dictation: false,
         };
         let sent = |send_window_titles: bool| {
-            let cfg = TypeSafeConfig {
-                send_window_titles,
-                ..TypeSafeConfig::default()
-            };
-            let c = Candidates::build("bring up kate", &ctx, &cfg);
+            let c = Candidates::build("bring up kate", &ctx, send_window_titles);
             let state = serde_json::to_string(&c.state("bring up kate", &ctx)).unwrap();
             let questions = serde_json::to_string(&c.questions).unwrap();
             state + &questions
@@ -1213,9 +1302,10 @@ mod tests {
             current_desktop: 1,
             desktop_count: 400,
             claude_running: false,
+            last_dictation: false,
         };
         let utterance = vec!["word"; 300].join(" ");
-        let c = Candidates::build(&utterance, &ctx, &TypeSafeConfig::default());
+        let c = Candidates::build(&utterance, &ctx, false);
         assert_eq!(c.windows.len(), WINDOW_CANDIDATES);
         assert_eq!(c.spans.len(), PAYLOAD_SPANS);
         assert!(c.spans[0].split_whitespace().count() > PAYLOAD_SPANS, "the first span runs to the end of the utterance");

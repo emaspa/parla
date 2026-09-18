@@ -12,8 +12,9 @@ use parla_grammar::Intent;
 
 use crate::judge::Resolved;
 
-/// The command a grammar intent asks for, or None for the replies
-/// (`Confirm`, `Deny`) that address the router rather than the desktop.
+/// The command a grammar intent asks for, or None for the intents that
+/// address the router rather than the desktop: the replies (`Confirm`,
+/// `Deny`) and the edits to the last dictation.
 /// Window queries keep the executor's convention that an empty query, or
 /// the bare word "window", means the focused window.
 pub fn from_intent(intent: Intent) -> Option<Command> {
@@ -40,7 +41,11 @@ pub fn from_intent(intent: Intent) -> Option<Command> {
         Intent::ClaudeRead => Command::ClaudeRead,
         Intent::Notify { text } => Command::Notify { text },
         Intent::Key { chord } => Command::Key { chord },
-        Intent::Confirm | Intent::Deny => return None,
+        // Replies address the router, and text edits the last dictation;
+        // neither is a desktop command.
+        Intent::ScratchThat | Intent::EditText { .. } | Intent::Confirm | Intent::Deny => {
+            return None
+        }
     })
 }
 

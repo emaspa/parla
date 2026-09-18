@@ -9,9 +9,9 @@
 
 use parla_grammar::Intent;
 
-use crate::config::TypeSafeConfig;
+use crate::config::JudgeConfig;
 
-/// Thresholds. Copied out of [`TypeSafeConfig`] so the policy can be built
+/// Thresholds. Copied out of [`JudgeConfig`] so the policy can be built
 /// and tested without the rest of the config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
@@ -26,8 +26,8 @@ pub struct Policy {
     pub destructive_threshold: f64,
 }
 
-impl From<&TypeSafeConfig> for Policy {
-    fn from(cfg: &TypeSafeConfig) -> Self {
+impl From<&JudgeConfig> for Policy {
+    fn from(cfg: &JudgeConfig) -> Self {
         Self {
             min_confidence: cfg.min_confidence,
             act_unconfirmed_above: cfg.act_unconfirmed_above,
@@ -39,7 +39,7 @@ impl From<&TypeSafeConfig> for Policy {
 
 impl Default for Policy {
     fn default() -> Self {
-        Self::from(&TypeSafeConfig::default())
+        Self::from(&JudgeConfig::default())
     }
 }
 
@@ -152,6 +152,8 @@ fn intent_name(intent: &Intent) -> &'static str {
         Intent::ClaudeRead => "claude_read",
         Intent::Notify { .. } => "notify",
         Intent::Key { .. } => "key",
+        Intent::ScratchThat => "scratch_that",
+        Intent::EditText { .. } => "edit_text",
         Intent::Confirm => "confirm",
         Intent::Deny => "deny",
     }

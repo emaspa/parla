@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 parla-grammar = { path = "../grammar" }
 desktopd = { path = "../desktopd" }
+parla-flow = { path = "../flow" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -24,6 +25,7 @@ zbus = { workspace = true }
 whisper-rs = { version = "0.16", features = ["cuda", "tracing_backend"] }
 # Only for the ggml backend registry, to tell whether the GPU came up.
 whisper-rs-sys = "0.15"
+llama-cpp-2 = { version = "0.1.156", features = ["cuda"] }
 cpal = "0.15"
 futures-util = "0.3.34"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

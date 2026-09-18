@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::Context as _;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 /// Whisper models are trained on 16 kHz audio; everything is resampled to it.
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -53,7 +53,13 @@ impl CaptureSession {
     /// [`stop`](Self::stop). Returns immediately; poll [`ready`](Self::ready)
     /// to learn whether the device opened. The buffer stops growing at
     /// `max_samples` (at [`SAMPLE_RATE`]).
-    pub fn start(device_name: Option<String>, max_samples: usize) -> anyhow::Result<Self> {
+    /// `level` receives the microphone level of every callback, 0 to 1 on
+    /// a decibel scale, for a meter; None when nobody shows one.
+    pub fn start(
+        device_name: Option<String>,
+        max_samples: usize,
+        level: Option<watch::Sender<f32>>,
+    ) -> anyhow::Result<Self> {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (stop_tx, stop_rx) = oneshot::channel::<()>();
         let (done_tx, done_rx) = oneshot::channel();
@@ -61,7 +67,7 @@ impl CaptureSession {
         std::thread::Builder::new()
             .name("parla-capture".into())
             .spawn(move || {
-                let stream = match open(device_name.as_deref(), max_samples, &buf) {
+                let stream = match open(device_name.as_deref(), max_samples, &buf, level) {
                     Ok((stream, name)) => {
                         let _ = ready_tx.send(Ok(name));
                         stream
@@ -123,6 +129,7 @@ fn open(
     device_name: Option<&str>,
     max_samples: usize,
     buffer: &Buffer,
+    level: Option<watch::Sender<f32>>,
 ) -> anyhow::Result<(cpal::Stream, String)> {
     let host = cpal::default_host();
     let device = match device_name {
@@ -152,6 +159,7 @@ fn open(
             max_samples,
             channels,
             buffer,
+            level.clone(),
             |s| s,
         )?,
         cpal::SampleFormat::I16 => build_stream::<i16, _>(
@@ -161,6 +169,7 @@ fn open(
             max_samples,
             channels,
             buffer,
+            level.clone(),
             |s| s as f32 / i16::MAX as f32,
         )?,
         cpal::SampleFormat::I32 => build_stream::<i32, _>(
@@ -170,6 +179,7 @@ fn open(
             max_samples,
             channels,
             buffer,
+            level.clone(),
             |s| s as f32 / i32::MAX as f32,
         )?,
         cpal::SampleFormat::I64 => build_stream::<i64, _>(
@@ -179,6 +189,7 @@ fn open(
             max_samples,
             channels,
             buffer,
+            level.clone(),
             |s| s as f32 / i64::MAX as f32,
         )?,
         cpal::SampleFormat::U8 => build_stream::<u8, _>(
@@ -188,6 +199,7 @@ fn open(
             max_samples,
             channels,
             buffer,
+            level.clone(),
             |s| (s as f32 - 128.0) / 128.0,
         )?,
         cpal::SampleFormat::U16 => build_stream::<u16, _>(
@@ -197,6 +209,7 @@ fn open(
             max_samples,
             channels,
             buffer,
+            level.clone(),
             |s| (s as f32 - 32768.0) / 32768.0,
         )?,
         other => anyhow::bail!("unsupported sample format {other:?}"),
@@ -205,6 +218,7 @@ fn open(
     Ok((stream, name))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream<T, C>(
     device: &cpal::Device,
     cfg: &cpal::SupportedStreamConfig,
@@ -212,6 +226,7 @@ fn build_stream<T, C>(
     max_samples: usize,
     channels: usize,
     buffer: &Buffer,
+    level: Option<watch::Sender<f32>>,
     convert: C,
 ) -> anyhow::Result<cpal::Stream>
 where
@@ -227,6 +242,9 @@ where
         &stream_cfg,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             let mono_f32: Vec<f32> = downmix(data, channels, &convert);
+            if let Some(level) = &level {
+                level.send_replace(meter(&mono_f32));
+            }
             let resampled = resampler.push(&mono_f32);
             let mut buf = buf.lock().unwrap_or_else(PoisonError::into_inner);
             let room = max_samples.saturating_sub(buf.len());
@@ -240,6 +258,20 @@ where
         None,
     )?;
     Ok(stream)
+}
+
+/// A meter reading for one callback's samples: RMS on a decibel scale, so
+/// quiet speech still moves it. -50 dBFS and below is 0, full scale is 1.
+fn meter(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db + 50.0) / 50.0).clamp(0.0, 1.0)
 }
 
 /// Average interleaved frames down to mono f32.

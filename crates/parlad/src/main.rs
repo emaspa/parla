@@ -11,10 +11,15 @@ mod command;
 mod config;
 mod confirm;
 mod cues;
+mod dbus;
+mod flow;
 mod hotkeys;
 mod instance;
 mod judge;
+mod local;
 mod lock;
+mod openai;
+mod oracle;
 mod policy;
 mod router;
 mod typesafe;
@@ -31,8 +36,12 @@ use tokio::time::Instant;
 use asr::Asr;
 use audio::CaptureSession;
 use config::DaemonConfig;
-use desktopd::Executor;
+use dbus::{Bus, Control, Notice, State};
+use desktopd::{Executor, Window};
+use flow::Flow;
 use hotkeys::{HotkeyEvent, HotkeyManager};
+use local::LocalModel;
+use parla_flow::Record;
 use parla_grammar::Grammar;
 use router::{Handled, Mode, Router};
 
@@ -56,10 +65,81 @@ async fn main() -> anyhow::Result<()> {
             let utterance = args.get(1..).map(|r| r.join(" ")).unwrap_or_default();
             return judge_once(&utterance).await;
         }
-        Some(other) => anyhow::bail!("unknown argument {other:?} (try --check or --judge)"),
+        Some("--flow") => {
+            let text = args.get(1).cloned().unwrap_or_default();
+            let class = args.get(2).cloned().unwrap_or_default();
+            return flow_once(&text, None, &class).await;
+        }
+        Some("--edit") => {
+            let text = args.get(1).cloned().unwrap_or_default();
+            let instruction = args.get(2).cloned().unwrap_or_default();
+            let class = args.get(3).cloned().unwrap_or_default();
+            return flow_once(&text, Some(&instruction), &class).await;
+        }
+        Some(other) => {
+            anyhow::bail!("unknown argument {other:?} (try --check, --judge, --flow or --edit)")
+        }
         None => {}
     }
     run().await
+}
+
+/// Load the shared GGUF when any backend asks for it. A failure disables
+/// the paths that wanted it rather than the daemon: the fast path and raw
+/// dictation still work.
+async fn load_local(cfg: &DaemonConfig) -> Option<Arc<LocalModel>> {
+    let judge_wants = cfg.judge.enabled && cfg.judge.backend == config::Backend::Local;
+    let flow_wants = cfg.flow.cleanup && cfg.flow.backend == config::FlowBackend::Local;
+    if !judge_wants && !flow_wants {
+        return None;
+    }
+    tracing::info!("loading local model...");
+    let local_cfg = cfg.local.clone();
+    match tokio::task::spawn_blocking(move || LocalModel::load(&local_cfg)).await {
+        Ok(Ok(m)) => Some(Arc::new(m)),
+        Ok(Err(e)) => {
+            tracing::warn!("local model unavailable: {e:#}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("local model load task panicked: {e}");
+            None
+        }
+    }
+}
+
+fn load_judge(cfg: &DaemonConfig, local: Option<Arc<LocalModel>>) -> Option<Arc<judge::Judge>> {
+    if !cfg.judge.enabled {
+        return None;
+    }
+    match judge::Judge::new(&cfg.judge, local) {
+        Ok(j) => {
+            tracing::info!("judged path enabled ({})", j.describe());
+            Some(Arc::new(j))
+        }
+        Err(e) => {
+            // Not fatal: the fast path is the point, judging is the net.
+            tracing::warn!("judged path disabled: {e:#}");
+            None
+        }
+    }
+}
+
+/// The dictation flow, with cleanup off if its backend is unavailable. A
+/// dictionary or snippet file that does not parse is still an error.
+fn load_flow(cfg: &DaemonConfig, local: Option<Arc<LocalModel>>) -> anyhow::Result<Arc<Flow>> {
+    let prompt = cfg.asr.initial_prompt.clone();
+    let flow = match Flow::load(&cfg.flow, prompt.clone(), local) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("dictation cleanup disabled: {e:#}");
+            let mut off = cfg.flow.clone();
+            off.cleanup = false;
+            Flow::load(&off, prompt, None)?
+        }
+    };
+    tracing::info!("dictation cleanup: {}", flow.describe());
+    Ok(Arc::new(flow))
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -81,6 +161,10 @@ async fn run() -> anyhow::Result<()> {
             .context("ASR load task panicked")??,
     );
 
+    let local = load_local(&cfg).await;
+    let judge = load_judge(&cfg, local.clone());
+    let flow = load_flow(&cfg, local)?;
+
     let (hotkeys, mut hotkey_rx) =
         HotkeyManager::register(&cfg.hotkeys.dictate, &cfg.hotkeys.command)
             .await
@@ -99,27 +183,40 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!("session is locked; waiting for unlock");
     }
 
-    let judge = if cfg.typesafe.enabled {
-        match judge::Judge::new(cfg.typesafe.clone()) {
-            Ok(j) => {
-                tracing::info!("judged path enabled (model {})", cfg.typesafe.model);
-                Some(Arc::new(j))
-            }
-            Err(e) => {
-                // Not fatal: the fast path is the point, judging is the net.
-                tracing::warn!("judged path disabled: {e:#}");
-                None
-            }
-        }
-    } else {
-        None
+    // The UI's view of the daemon. Without a bus there is no UI, and
+    // nothing else changes.
+    let info = dbus::Info {
+        version: env!("CARGO_PKG_VERSION").into(),
+        judge: judge.as_ref().map(|j| j.describe()).unwrap_or_default(),
+        cleanup: if flow.cleanup_enabled() {
+            flow.describe()
+        } else {
+            String::new()
+        },
+        dictate_hotkey: cfg.hotkeys.dictate.clone(),
+        command_hotkey: cfg.hotkeys.command.clone(),
     };
+    let (bus, mut control_rx) = match dbus::serve(&conn, Arc::clone(&flow), info).await {
+        Ok((bus, rx)) => {
+            tracing::info!("on the session bus as {}", dbus::NAME);
+            (Some(bus), Some(rx))
+        }
+        Err(e) => {
+            tracing::warn!("not on the session bus ({e:#}); the UI will not see this daemon");
+            (None, None)
+        }
+    };
+    if let Some(bus) = &bus {
+        tokio::spawn(publish_lock(lock_rx.clone(), bus.clone()));
+    }
 
     let router = Arc::new(Router::new(
         Arc::clone(&executor),
         Arc::clone(&grammar),
         judge,
+        Arc::clone(&flow),
         Duration::from_millis(cfg.router.confirm_window_ms),
+        bus.clone(),
     ));
 
     // One worker handles utterances in release order, so two quick
@@ -132,10 +229,18 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&asr),
         Arc::clone(&router),
         lock_rx.clone(),
+        bus.clone(),
     ));
 
     let mut capture: Option<Capture> = None;
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let ctx = LoopCtx {
+        cfg: &cfg,
+        executor: &executor,
+        lock_rx: &lock_rx,
+        bus: bus.as_ref(),
+        job_tx: &job_tx,
+    };
 
     tracing::info!("parlad ready");
     let outcome = loop {
@@ -147,18 +252,63 @@ async fn run() -> anyhow::Result<()> {
                         "hotkey signal loop ended; exiting so the service manager restarts parlad"
                     ));
                 };
+                let enabled = bus.as_ref().is_none_or(Bus::enabled);
                 match ev {
+                    HotkeyEvent::DictatePressed | HotkeyEvent::CommandPressed if !enabled => {
+                        tracing::info!("disabled from the UI; ignoring {ev:?}");
+                    }
                     HotkeyEvent::DictatePressed => {
-                        start_capture(&mut capture, Mode::Dictate, &cfg, &lock_rx);
+                        if let Err(e) = start_capture(&mut capture, Mode::Dictate, &ctx) {
+                            tracing::debug!("{e:#}");
+                        }
                     }
                     HotkeyEvent::CommandPressed => {
-                        start_capture(&mut capture, Mode::Command, &cfg, &lock_rx);
+                        if let Err(e) = start_capture(&mut capture, Mode::Command, &ctx) {
+                            tracing::debug!("{e:#}");
+                        }
                     }
                     HotkeyEvent::DictateReleased => {
-                        finish_capture(&mut capture, Some(Mode::Dictate), &cfg, &lock_rx, &job_tx);
+                        finish_capture(&mut capture, Some(Mode::Dictate), &ctx);
                     }
                     HotkeyEvent::CommandReleased => {
-                        finish_capture(&mut capture, Some(Mode::Command), &cfg, &lock_rx, &job_tx);
+                        finish_capture(&mut capture, Some(Mode::Command), &ctx);
+                    }
+                }
+            }
+            control = next_control(&mut control_rx) => {
+                match control {
+                    Control::Start(mode, reply) => {
+                        let _ = reply.send(start_capture(&mut capture, mode, &ctx));
+                    }
+                    Control::Stop(reply) => {
+                        let _ = reply.send(if capture.is_some() {
+                            finish_capture(&mut capture, None, &ctx);
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!("not recording"))
+                        });
+                    }
+                    Control::Cancel(reply) => {
+                        let _ = reply.send(match capture.take() {
+                            Some(c) => {
+                                tracing::info!("{:?} capture cancelled from the UI", c.mode);
+                                drop(c);
+                                if let Some(bus) = &bus {
+                                    bus.finish("cancelled", false);
+                                }
+                                Ok(())
+                            }
+                            None => Err(anyhow::anyhow!("not recording")),
+                        });
+                    }
+                    Control::Enabled(enabled) => {
+                        tracing::info!("{} from the UI", if enabled { "enabled" } else { "disabled" });
+                        if let Some(bus) = &bus {
+                            if capture.is_none() && matches!(bus.state(), State::Idle | State::Paused) {
+                                let paused = !enabled || *lock_rx.borrow();
+                                bus.set_state(if paused { State::Paused } else { State::Idle }, None);
+                            }
+                        }
                     }
                 }
             }
@@ -176,10 +326,7 @@ async fn run() -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::error!("capture start failed: {e:#}");
                         capture = None;
-                        if cfg.router.cues {
-                            cues::play(cues::Cue::Error);
-                        }
-                        notify("parla capture failed", &format!("{e:#}"));
+                        ctx.fail(&format!("capture failed: {e:#}"));
                     }
                 }
             }
@@ -188,7 +335,7 @@ async fn run() -> anyhow::Result<()> {
                     "hotkey held longer than {} ms without a release; finishing capture",
                     cfg.audio.max_hold_ms
                 );
-                finish_capture(&mut capture, None, &cfg, &lock_rx, &job_tx);
+                finish_capture(&mut capture, None, &ctx);
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("SIGINT: shutting down");
@@ -225,18 +372,45 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// How long a stopped capture may take to hand over its samples.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// What the main loop's capture handling needs from the daemon.
+struct LoopCtx<'a> {
+    cfg: &'a DaemonConfig,
+    executor: &'a Arc<Executor>,
+    lock_rx: &'a watch::Receiver<bool>,
+    bus: Option<&'a Bus>,
+    job_tx: &'a mpsc::Sender<Job>,
+}
+
+impl LoopCtx<'_> {
+    /// An error before anything was transcribed: cue, notify, tell the UI.
+    fn fail(&self, message: &str) {
+        if self.cfg.router.cues {
+            cues::play(cues::Cue::Error);
+        }
+        notify("parla", message);
+        if let Some(bus) = self.bus {
+            bus.finish(message, true);
+            bus.notice(Notice::Error(message.to_string()));
+        }
+    }
+}
+
 /// A running push-to-talk capture.
 struct Capture {
     mode: Mode,
     session: CaptureSession,
     /// When the hold is treated as released even without a Released signal.
     deadline: Instant,
+    /// The window that had focus when the key went down, looked up in the
+    /// background so the capture starts without waiting on kdotool.
+    focus: tokio::task::JoinHandle<Option<Window>>,
 }
 
 /// A finished capture, queued for transcription and routing.
 struct Job {
     mode: Mode,
     samples: audio::Stopped,
+    focus: tokio::task::JoinHandle<Option<Window>>,
 }
 
 /// Resolves when the active capture's device opens or fails; pends for ever
@@ -256,55 +430,82 @@ async fn hold_expired(deadline: Option<Instant>) {
     }
 }
 
-fn start_capture(
-    capture: &mut Option<Capture>,
-    mode: Mode,
-    cfg: &DaemonConfig,
-    lock_rx: &watch::Receiver<bool>,
-) {
-    if capture.is_some() {
-        tracing::warn!("hotkey pressed while already capturing; ignored");
-        return;
+/// The next request from the bus; pends for ever without a bus, or once
+/// the bus side is gone, so it is safe as a `select!` arm.
+async fn next_control(rx: &mut Option<mpsc::Receiver<Control>>) -> Control {
+    match rx {
+        Some(rx) => match rx.recv().await {
+            Some(c) => c,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
     }
-    if *lock_rx.borrow() {
+}
+
+/// Mirror the session lock onto the bus state while nothing is in flight.
+async fn publish_lock(mut lock_rx: watch::Receiver<bool>, bus: Bus) {
+    while lock_rx.changed().await.is_ok() {
+        let locked = *lock_rx.borrow();
+        match (locked, bus.state()) {
+            (true, State::Idle) => bus.set_state(State::Paused, None),
+            (false, State::Paused) if bus.enabled() => bus.set_state(State::Idle, None),
+            _ => {}
+        }
+    }
+}
+
+fn start_capture(capture: &mut Option<Capture>, mode: Mode, ctx: &LoopCtx<'_>) -> anyhow::Result<()> {
+    if capture.is_some() {
+        tracing::warn!("capture requested while already capturing; ignored");
+        anyhow::bail!("already recording");
+    }
+    if *ctx.lock_rx.borrow() {
         // locked session: input goes to the lock screen and voice must be
         // inert anyway (plan §5)
-        tracing::info!("session locked; ignoring {mode:?} hotkey");
+        tracing::info!("session locked; ignoring {mode:?} request");
         notify("parla", "Session locked — voice paused");
-        return;
+        anyhow::bail!("the session is locked");
     }
+    let cfg = ctx.cfg;
     // Room for the whole hold plus a little slack; the buffer is capped
     // there, so a runaway stream cannot eat memory.
     let max_samples = samples_for_ms(cfg.audio.max_hold_ms + 1_000);
-    match CaptureSession::start(cfg.audio.device.clone(), max_samples) {
+    let level = ctx.bus.map(Bus::level);
+    match CaptureSession::start(cfg.audio.device.clone(), max_samples, level) {
         Ok(session) => {
             tracing::debug!("{mode:?} capture starting");
+            let executor = Arc::clone(ctx.executor);
+            let focus = tokio::spawn(async move { executor.active_window().await.ok().flatten() });
             *capture = Some(Capture {
                 mode,
                 session,
                 deadline: Instant::now() + Duration::from_millis(cfg.audio.max_hold_ms),
+                focus,
             });
+            if let Some(bus) = ctx.bus {
+                bus.set_state(State::Recording, Some(mode));
+            }
+            Ok(())
         }
         Err(e) => {
             tracing::error!("capture start failed: {e:#}");
-            if cfg.router.cues {
-                cues::play(cues::Cue::Error);
-            }
-            notify("parla capture failed", &format!("{e:#}"));
+            ctx.fail(&format!("capture failed: {e:#}"));
+            Err(e)
         }
     }
 }
 
 /// Stop the active capture and queue it for processing. `released` is the
-/// mode whose key was released, or None when the hold timer fired.
-fn finish_capture(
-    capture: &mut Option<Capture>,
-    released: Option<Mode>,
-    cfg: &DaemonConfig,
-    lock_rx: &watch::Receiver<bool>,
-    job_tx: &mpsc::Sender<Job>,
-) {
-    let Some(Capture { mode, session, .. }) = capture.take() else {
+/// mode whose key was released, or None when the hold timer fired or the
+/// UI asked.
+fn finish_capture(capture: &mut Option<Capture>, released: Option<Mode>, ctx: &LoopCtx<'_>) {
+    let Some(Capture {
+        mode,
+        session,
+        focus,
+        ..
+    }) = capture.take()
+    else {
         tracing::debug!("release without active capture");
         return;
     };
@@ -313,25 +514,29 @@ fn finish_capture(
             tracing::warn!("release {released:?} but captured {mode:?}; using captured mode");
         }
     }
+    let cfg = ctx.cfg;
     if cfg.router.cues {
         cues::play(cues::Cue::Stop);
     }
     let samples = session.stop();
-    if *lock_rx.borrow() {
+    if *ctx.lock_rx.borrow() {
         // Locked between press and release: whatever was said goes nowhere.
         tracing::info!("session locked during {mode:?} capture; discarding utterance");
-        if cfg.router.cues {
-            cues::play(cues::Cue::Error);
-        }
+        ctx.fail("session locked; utterance discarded");
         return;
     }
-    match job_tx.try_send(Job { mode, samples }) {
+    if let Some(bus) = ctx.bus {
+        bus.set_state(State::Transcribing, Some(mode));
+    }
+    match ctx.job_tx.try_send(Job {
+        mode,
+        samples,
+        focus,
+    }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::error!("{JOB_QUEUE} utterances already waiting on ASR; dropping this one");
-            if cfg.router.cues {
-                cues::play(cues::Cue::Error);
-            }
+            ctx.fail("too many utterances waiting; dropped one");
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             tracing::error!("utterance worker is gone; dropping {mode:?} utterance");
@@ -346,78 +551,176 @@ async fn worker(
     asr: Arc<Asr>,
     router: Arc<Router>,
     lock_rx: watch::Receiver<bool>,
+    bus: Option<Bus>,
 ) {
-    while let Some(Job { mode, samples }) = jobs.recv().await {
-        let outcome = process(samples, &cfg.audio, &asr, &router, &lock_rx, mode).await;
-        match outcome {
-            Ok(Outcome::Handled(Handled::Done(msg))) => {
-                tracing::info!("{mode:?} done: {msg}");
-                if cfg.router.notify_results {
-                    notify("parla", &msg);
-                }
-            }
-            Ok(Outcome::Handled(Handled::Confirm(question))) => {
-                // The user has to hear this one whatever notify_results
-                // says: the action is waiting on their answer.
-                tracing::info!("{mode:?} waiting: {question}");
-                if cfg.router.cues {
-                    cues::play(cues::Cue::Stop);
-                }
-                notify("parla", &question);
-            }
-            Ok(Outcome::Locked) => {
-                tracing::info!("session locked; discarding transcribed {mode:?} utterance");
-                if cfg.router.cues {
-                    cues::play(cues::Cue::Error);
-                }
-            }
+    while let Some(Job {
+        mode,
+        samples,
+        focus,
+    }) = jobs.recv().await
+    {
+        let t0 = std::time::Instant::now();
+        let focused = focus.await.ok().flatten();
+        let heard = match transcribe(samples, &cfg.audio, &asr, router.flow()).await {
+            Ok(h) => h,
             Err(e) => {
-                tracing::warn!("{mode:?} failed: {e:#}");
-                if cfg.router.cues {
-                    cues::play(cues::Cue::Error);
+                report(&cfg, bus.as_ref(), mode, Err(e));
+                continue;
+            }
+        };
+        // Last check before anything touches the desktop: transcription
+        // takes long enough for the screen to have locked in the meantime.
+        if *lock_rx.borrow() {
+            tracing::info!("session locked; discarding transcribed {mode:?} utterance");
+            report(&cfg, bus.as_ref(), mode, Err(anyhow::anyhow!("session locked; utterance discarded")));
+            continue;
+        }
+        let result = router.handle(mode, &heard.transcript, focused.as_ref()).await;
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let record = record_of(mode, &heard, focused.as_ref(), &result, latency_ms);
+        if let Some(record) = router.flow().record(record) {
+            if let Some(bus) = &bus {
+                bus.notice(Notice::Utterance(Box::new(record)));
+            }
+        }
+        let asked = matches!(result, Ok(Handled::Confirm(_)));
+        report(&cfg, bus.as_ref(), mode, result);
+        if let (Some(bus), true) = (&bus, asked) {
+            // The prompt stays answerable for the confirm window; the UI
+            // shows it that long unless something else happens first.
+            let bus = bus.clone();
+            let window = Duration::from_millis(cfg.router.confirm_window_ms);
+            tokio::spawn(async move {
+                tokio::time::sleep(window).await;
+                if bus.state() == State::Waiting {
+                    bus.finish("", false);
                 }
-                if cfg.router.notify_results {
-                    notify("parla", &format!("{e:#}"));
-                }
+            });
+        }
+    }
+}
+
+/// Tell the user and the UI what became of an utterance.
+fn report(cfg: &DaemonConfig, bus: Option<&Bus>, mode: Mode, result: anyhow::Result<Handled>) {
+    match result {
+        Ok(Handled::Done(msg)) => {
+            tracing::info!("{mode:?} done: {msg}");
+            if cfg.router.notify_results {
+                notify("parla", &msg);
+            }
+            if let Some(bus) = bus {
+                bus.finish(&msg, false);
+            }
+        }
+        Ok(Handled::Typed(p)) => {
+            let words = parla_flow::text::word_count(&p.text);
+            let msg = match p.outcome {
+                "snippet" => "inserted a snippet".to_string(),
+                "edited" => format!("rewrote it: {} words", words),
+                _ => format!("typed {words} words"),
+            };
+            tracing::info!("{mode:?} {msg}");
+            if let Some(bus) = bus {
+                bus.finish(&msg, false);
+            }
+        }
+        Ok(Handled::Confirm(question)) => {
+            // The user has to hear this one whatever notify_results
+            // says: the action is waiting on their answer.
+            tracing::info!("{mode:?} waiting: {question}");
+            if cfg.router.cues {
+                cues::play(cues::Cue::Stop);
+            }
+            notify("parla", &question);
+            if let Some(bus) = bus {
+                bus.set_state(State::Waiting, None);
+                bus.notice(Notice::Confirm(question));
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::warn!("{mode:?} failed: {msg}");
+            if cfg.router.cues {
+                cues::play(cues::Cue::Error);
+            }
+            if cfg.router.notify_results {
+                notify("parla", &msg);
+            }
+            if let Some(bus) = bus {
+                bus.finish(&msg, true);
+                bus.notice(Notice::Error(msg));
             }
         }
     }
 }
 
-enum Outcome {
-    Handled(Handled),
-    /// The session locked before anything was injected or executed.
-    Locked,
+/// What whisper made of a capture.
+struct Heard {
+    transcript: String,
+    audio_ms: u64,
 }
 
-async fn process(
+async fn transcribe(
     samples: audio::Stopped,
     audio_cfg: &config::AudioConfig,
     asr: &Arc<Asr>,
-    router: &Router,
-    lock_rx: &watch::Receiver<bool>,
-    mode: Mode,
-) -> anyhow::Result<Outcome> {
+    flow: &Flow,
+) -> anyhow::Result<Heard> {
     // The capture thread hands the samples over as soon as it closes the
     // stream; if PipeWire wedges that close, do not wedge the whole queue.
     let samples = tokio::time::timeout(STOP_GRACE, samples)
         .await
         .context("capture device did not stop in time")??;
     let trimmed = vad::validate(&samples, audio::SAMPLE_RATE, audio_cfg)?;
+    let audio_ms = trimmed.len() as u64 * 1000 / u64::from(audio::SAMPLE_RATE);
     let asr = Arc::clone(asr);
-    let transcript = tokio::task::spawn_blocking(move || asr.transcribe(&trimmed))
+    let prompt = flow.asr_prompt();
+    let transcript = tokio::task::spawn_blocking(move || asr.transcribe(&trimmed, prompt.as_deref()))
         .await
         .context("ASR task panicked")??;
     anyhow::ensure!(!transcript.is_empty(), "heard nothing usable");
-    // Last check before anything touches the desktop: transcription takes
-    // long enough for the screen to have locked in the meantime.
-    if *lock_rx.borrow() {
-        return Ok(Outcome::Locked);
+    Ok(Heard {
+        transcript,
+        audio_ms,
+    })
+}
+
+/// The history line for one utterance.
+fn record_of(
+    mode: Mode,
+    heard: &Heard,
+    focused: Option<&Window>,
+    result: &anyhow::Result<Handled>,
+    latency_ms: u64,
+) -> Record {
+    let (text, outcome, detail, profile) = match result {
+        Ok(Handled::Typed(p)) => (p.text.clone(), p.outcome.to_string(), String::new(), p.profile.clone()),
+        Ok(Handled::Done(msg)) => (String::new(), "command".to_string(), msg.clone(), String::new()),
+        Ok(Handled::Confirm(q)) => (String::new(), "confirm".to_string(), q.clone(), String::new()),
+        Err(e) => (String::new(), "error".to_string(), format!("{e:#}"), String::new()),
+    };
+    Record {
+        mode: match mode {
+            Mode::Dictate => "dictate",
+            Mode::Command => "command",
+        }
+        .into(),
+        app: focused.map(|w| w.class.clone()).unwrap_or_default(),
+        title: focused.map(|w| w.title.clone()).unwrap_or_default(),
+        raw: heard.transcript.clone(),
+        words: parla_flow::text::word_count(if text.is_empty() {
+            &heard.transcript
+        } else {
+            &text
+        }),
+        text,
+        profile,
+        audio_ms: heard.audio_ms,
+        latency_ms,
+        outcome,
+        detail,
+        ..Record::default()
     }
-    router
-        .handle(mode, &transcript)
-        .await
-        .map(Outcome::Handled)
 }
 
 fn samples_for_ms(ms: u64) -> usize {
@@ -469,15 +772,26 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
 
     // The same executor, snapshot and policy the daemon would use, so what
     // this prints is what would have happened.
-    let judge = Arc::new(judge::Judge::new(cfg.typesafe.clone())?);
+    anyhow::ensure!(cfg.judge.enabled, "judge.enabled = false in the config");
+    let local = load_local(&cfg).await;
+    let judge = Arc::new(judge::Judge::new(&cfg.judge, local)?);
+    println!("judge:     {}", judge.describe());
     let executor = Arc::new(Executor::new(cfg.desktopd.clone()).await?);
+    let mut flow_cfg = cfg.flow.clone();
+    flow_cfg.cleanup = false;
+    flow_cfg.history = false;
+    let flow = Arc::new(Flow::load(&flow_cfg, None, None)?);
     let router = Router::new(
         Arc::clone(&executor),
         Arc::new(grammar),
         Some(Arc::clone(&judge)),
+        flow,
         Duration::from_millis(cfg.router.confirm_window_ms),
+        None,
     );
-    let snapshot = router.snapshot().await?;
+    let mut snapshot = router.snapshot(None).await?;
+    // Pretend something was just dictated, to try the edit intents.
+    snapshot.last_dictation = std::env::var_os("PARLA_LAST_DICTATION").is_some();
     let index = executor.desktop_index();
     println!(
         "state: {} apps indexed, {} windows open, desktop {}/{}, claude {}",
@@ -497,6 +811,13 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
             println!("judged:    {:?}", resolved.intent);
             println!("confidence: {:.2}", resolved.confidence);
             let decision = router.policy().decide(&resolved.intent, &resolved.signals);
+            if let parla_grammar::Intent::EditText { instruction } = &resolved.intent {
+                match decision {
+                    policy::Decision::Refuse { reason } => println!("would refuse: {reason}"),
+                    _ => println!("would rewrite the last dictation as told: {instruction:?}"),
+                }
+                return Ok(());
+            }
             let command = command::from_resolved(resolved).context("judge produced a reply")?;
             println!("command:   {command:?}");
             match decision {
@@ -509,6 +830,54 @@ async fn judge_once(utterance: &str) -> anyhow::Result<()> {
         }
         judge::Verdict::Dictation => println!("judged:    dictation, not a command"),
         judge::Verdict::Unclear(r) => println!("judged:    unclear ({r})"),
+    }
+    Ok(())
+}
+
+/// `parlad --flow "<text>" [window class]`: run one transcript through the
+/// dictation flow (snippets, dictionary, cleanup for that window class) and
+/// print what would be typed, without typing it. The way to try a profile's
+/// instructions or a dictionary entry. With `--edit "<text>" "<instruction>"`
+/// it applies a spoken edit to `text` instead.
+async fn flow_once(text: &str, instruction: Option<&str>, class: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !text.trim().is_empty() && instruction.is_none_or(|i| !i.trim().is_empty()),
+        "usage: parlad --flow \"<transcript>\" [window class]\n       parlad --edit \"<text>\" \"<instruction>\" [window class]"
+    );
+    let cfg = DaemonConfig::load()?;
+    let mut flow_cfg = cfg.flow.clone();
+    flow_cfg.history = false;
+    let local = if flow_cfg.cleanup && flow_cfg.backend == config::FlowBackend::Local {
+        let local_cfg = cfg.local.clone();
+        Some(Arc::new(
+            tokio::task::spawn_blocking(move || LocalModel::load(&local_cfg))
+                .await
+                .context("model load task panicked")??,
+        ))
+    } else {
+        None
+    };
+    let flow = Flow::load(&flow_cfg, cfg.asr.initial_prompt.clone(), local)?;
+    let profile = flow.profile_for(class);
+    println!("transcript: {text:?}");
+    println!("window:     {:?} -> profile {:?} (tone {}, cleanup {})",
+        class, profile.name, profile.tone.as_str(), if profile.cleanup { "on" } else { "off" });
+    println!("cleanup:    {}", flow.describe());
+    if let Some(p) = flow.asr_prompt() {
+        println!("asr prompt: {p:?}");
+    }
+    let t0 = std::time::Instant::now();
+    match instruction {
+        Some(instruction) => {
+            let out = flow.edit(text, instruction, class).await?;
+            println!("edit:       {instruction:?} in {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+            println!("would type: {out:?}");
+        }
+        None => {
+            let out = flow.process(text, class).await;
+            println!("outcome:    {} in {:.0}ms", out.outcome, t0.elapsed().as_secs_f64() * 1000.0);
+            println!("would type: {:?}", out.text);
+        }
     }
     Ok(())
 }
@@ -526,6 +895,37 @@ async fn check() -> anyhow::Result<()> {
             "NO — run scripts/fetch-model.sh"
         }
     );
+    let path = &cfg.local.model_path;
+    println!("local model:   {}", path.display());
+    println!(
+        "local present: {}",
+        if path.exists() {
+            "yes"
+        } else {
+            "NO — run scripts/fetch-model.sh"
+        }
+    );
+    if cfg.judge.enabled {
+        println!("judge:         {} backend", cfg.judge.backend);
+    } else {
+        println!("judge:         disabled");
+    }
+    if cfg.flow.cleanup {
+        println!("cleanup:       {} backend", cfg.flow.backend);
+    } else {
+        println!("cleanup:       off");
+    }
+    for (what, path, count) in [
+        ("dictionary", parla_flow::paths::dictionary(), parla_flow::Dictionary::load(&parla_flow::paths::dictionary()).map(|d| format!("{} words, {} replacements", d.words.len(), d.replacements.len()))),
+        ("snippets", parla_flow::paths::snippets(), parla_flow::Snippets::load(&parla_flow::paths::snippets()).map(|s| format!("{} snippets", s.snippets.len()))),
+        ("app profiles", parla_flow::paths::apps(), parla_flow::AppProfiles::load(&parla_flow::paths::apps()).map(|a| format!("{} profiles", a.apps.len()))),
+    ] {
+        match count {
+            Ok(c) => println!("{what:<14} {c} ({}{})", path.display(), if path.exists() { "" } else { ", not written yet" }),
+            Err(e) => println!("{what:<14} FAILED: {e:#}"),
+        }
+    }
+    println!("history:       {}", if cfg.flow.history { parla_flow::paths::history().display().to_string() } else { "off".into() });
     println!(
         "hotkeys:       dictate={} command={} (parsed: {:#x} {:#x})",
         cfg.hotkeys.dictate,
@@ -553,6 +953,15 @@ async fn check() -> anyhow::Result<()> {
     }
     let conn = desktopd::bus::session().await?;
     println!("session locked: {}", lock::is_locked(&conn).await);
+    let owned = zbus::fdo::DBusProxy::new(&conn)
+        .await?
+        .name_has_owner(dbus::NAME.try_into()?)
+        .await?;
+    println!(
+        "session bus:   {} {}",
+        dbus::NAME,
+        if owned { "is taken (a parlad is running)" } else { "is free" }
+    );
     println!("all checks passed");
     Ok(())
 }

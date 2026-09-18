@@ -1,0 +1,14 @@
+[package]
+name = "parla-flow"
+description = "What parla knows about the user's words: dictionary, snippets, per-app profiles, dictation history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+toml = { workspace = true }
+libc = "0.2"

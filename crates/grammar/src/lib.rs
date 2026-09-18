@@ -99,6 +99,24 @@ mod tests {
     }
 
     #[test]
+    fn taking_back_a_dictation() {
+        for said in ["scratch that", "Delete that.", "undo", "erase that"] {
+            assert_eq!(parse(said), Some(Intent::ScratchThat), "{said}");
+        }
+        // Free-form edits are the judged path's to recognise.
+        assert_eq!(parse("make that more formal"), None);
+        assert_eq!(
+            Intent::from_args(
+                "edit_text",
+                &[("instruction".to_string(), "shorter".to_string())].into()
+            ),
+            Some(Intent::EditText {
+                instruction: "shorter".into()
+            })
+        );
+    }
+
+    #[test]
     fn launch_and_focus() {
         assert_eq!(
             parse("Open Firefox."),

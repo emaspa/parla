@@ -1,138 +1,31 @@
-//! Minimal TypeSafe System One client (`POST /v1/systemone`).
+//! Minimal TypeSafe System One client (`POST /v1/systemone`): the cloud
+//! backend of the judged path.
 //!
 //! There is no Rust SDK, so this is the HTTP API directly: one request carries
 //! the state plus every question, the model answers them independently and in
 //! parallel, and answers come back under the ids we chose. Retries transient
 //! failures with backoff under one overall deadline, which is the one thing
-//! the official SDKs add.
+//! the official SDKs add. The question and answer types are the shared ones
+//! in [`crate::oracle`]; their serde attributes are this API's wire format.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::time::Instant;
+
+use crate::oracle::{Question, Response};
 
 const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 
-/// The API refuses a choice question with more options than this.
-pub const MAX_CHOICE_OPTIONS: usize = 255;
-
 const MAX_ATTEMPTS: u32 = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-
-/// A question's `instructions` or a criteria entry: a bare string, or a
-/// structured object whose field names we choose (the model sees both names
-/// and values).
-pub type Prose = serde_json::Value;
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Question {
-    /// Yes/no. The answer is the probability of yes — there is no separate
-    /// confidence field.
-    Noul {
-        instructions: Prose,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        criteria: Option<NoulCriteria>,
-    },
-    /// One option from a defined set (at most [`MAX_CHOICE_OPTIONS`]). Always
-    /// give it a no-match option when the set may not cover the input.
-    Choice {
-        instructions: Prose,
-        criteria: BTreeMap<String, Prose>,
-    },
-    /// Position along ordered levels (2–10). Unused so far, kept because the
-    /// wire type is part of the API surface.
-    #[allow(dead_code)]
-    Score {
-        instructions: Prose,
-        criteria: Vec<Prose>,
-    },
-}
-
-impl Question {
-    /// The option names a choice question offers; None for other kinds.
-    pub fn options(&self) -> Option<&BTreeMap<String, Prose>> {
-        match self {
-            Question::Choice { criteria, .. } => Some(criteria),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct NoulCriteria {
-    /// What a value near 1 means.
-    #[serde(rename = "true")]
-    pub yes: String,
-    /// What a value near 0 means.
-    #[serde(rename = "false")]
-    pub no: String,
-}
 
 #[derive(Debug, Serialize)]
 struct Request<'a> {
     state: &'a serde_json::Value,
     model: &'a str,
     questions: &'a BTreeMap<String, Question>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Response {
-    pub answers: BTreeMap<String, Answer>,
-    /// Token accounting. Optional: it is informational, and its absence must
-    /// not throw away the answers.
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Usage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Answer {
-    Noul {
-        noul: f64,
-    },
-    Choice {
-        choice: String,
-        confidence: f64,
-        #[allow(dead_code)]
-        probabilities: BTreeMap<String, f64>,
-    },
-    #[allow(dead_code)]
-    Score {
-        score: f64,
-        confidence: f64,
-    },
-    /// An answer type this client does not know. Reads as "not answered", so
-    /// a new type on the API side degrades one question, not the request.
-    #[serde(other)]
-    Unknown,
-}
-
-impl Response {
-    /// Probability of yes for a noul question, or None if absent/wrong type.
-    pub fn noul(&self, id: &str) -> Option<f64> {
-        match self.answers.get(id) {
-            Some(Answer::Noul { noul }) => Some(*noul),
-            _ => None,
-        }
-    }
-
-    /// Chosen option and its confidence, or None if absent/wrong type.
-    pub fn choice(&self, id: &str) -> Option<(&str, f64)> {
-        match self.answers.get(id) {
-            Some(Answer::Choice {
-                choice, confidence, ..
-            }) => Some((choice.as_str(), *confidence)),
-            _ => None,
-        }
-    }
 }
 
 pub struct Client {
@@ -172,6 +65,10 @@ impl Client {
             model,
             timeout,
         })
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// Evaluate every question against one state within `timeout` of wall
@@ -252,49 +149,6 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse(v: serde_json::Value) -> Response {
-        serde_json::from_value(v).expect("response should deserialize")
-    }
-
-    #[test]
-    fn missing_usage_keeps_the_answers() {
-        let r = parse(serde_json::json!({
-            "model": "jev-latest",
-            "answers": { "is_dictation": { "type": "noul", "noul": 0.1 } },
-        }));
-        assert!(r.usage.is_none());
-        assert_eq!(r.noul("is_dictation"), Some(0.1));
-    }
-
-    #[test]
-    fn unknown_answer_type_degrades_one_question_only() {
-        let r = parse(serde_json::json!({
-            "answers": {
-                "intent": { "type": "ranking", "ranking": ["a", "b"] },
-                "is_dictation": { "type": "noul", "noul": 0.2 },
-            },
-            "usage": { "input_tokens": 1, "output_tokens": 2 },
-        }));
-        assert!(matches!(r.answers.get("intent"), Some(Answer::Unknown)));
-        assert_eq!(r.choice("intent"), None);
-        assert_eq!(r.noul("is_dictation"), Some(0.2));
-    }
-
-    #[test]
-    fn wrong_answer_type_for_an_id_reads_as_unanswered() {
-        let r = parse(serde_json::json!({
-            "answers": {
-                "is_dictation": {
-                    "type": "choice", "choice": "yes", "confidence": 0.9,
-                    "probabilities": { "yes": 0.9 },
-                },
-                "intent": { "type": "noul", "noul": 0.9 },
-            },
-        }));
-        assert_eq!(r.noul("is_dictation"), None);
-        assert_eq!(r.choice("intent"), None);
-    }
 
     #[test]
     fn retry_after_seconds_only() {

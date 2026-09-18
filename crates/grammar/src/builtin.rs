@@ -26,6 +26,12 @@ const RULES: &[RuleRow] = &[
     ("stop", "deny", None),
     ("never mind", "deny", None),
     ("nevermind", "deny", None),
+    // the text just dictated
+    ("scratch that", "scratch_that", None),
+    ("delete that", "scratch_that", None),
+    ("undo that", "scratch_that", None),
+    ("undo", "scratch_that", None),
+    ("erase that", "scratch_that", None),
     // terminal
     ("open terminal", "open_terminal", None),
     ("open konsole", "open_terminal", None),

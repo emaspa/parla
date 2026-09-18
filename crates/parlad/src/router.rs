@@ -1,9 +1,14 @@
-//! The router: dictation commits straight to the focused window; commands go
-//! through the fast-path grammar first and fall through to the judged path.
-//! Both paths end in the same [`Policy`] decision, and what the policy wants
-//! confirmed waits in [`Confirmations`] for the next command-mode utterance.
+//! The router: dictation goes through the flow (snippets, dictionary,
+//! cleanup) and is typed into the focused window; commands go through the
+//! fast-path grammar first and fall through to the judged path. Both
+//! command paths end in the same [`Policy`] decision, and what the policy
+//! wants confirmed waits in [`Confirmations`] for the next command-mode
+//! utterance.
+//!
+//! The router also remembers the last dictation for a while, so "scratch
+//! that" can take it back and "make that more formal" can rewrite it.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -12,6 +17,8 @@ use parla_grammar::{Grammar, Intent};
 
 use crate::command::{from_intent, from_resolved};
 use crate::confirm::{check_target, Confirmations, Pending, Taken};
+use crate::dbus::{Bus, State};
+use crate::flow::{Flow, Processed};
 use crate::judge::{Context, Judge, Verdict};
 use crate::policy::{Decision, Policy, Signals};
 
@@ -32,6 +39,7 @@ pub struct Snapshot {
     pub current_desktop: u32,
     pub desktop_count: u32,
     pub claude_running: bool,
+    pub last_dictation: bool,
 }
 
 impl Snapshot {
@@ -42,27 +50,42 @@ impl Snapshot {
             current_desktop: self.current_desktop,
             desktop_count: self.desktop_count,
             claude_running: self.claude_running,
+            last_dictation: self.last_dictation,
         }
     }
 }
 
 /// What handling an utterance came to. `Done` is a result to report;
 /// `Confirm` is a question the user has to answer by voice, so the caller
-/// should make sure it is heard.
+/// should make sure it is heard; `Typed` is dictation that landed, with
+/// what became of the transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Handled {
     Done(String),
     Confirm(String),
+    Typed(Processed),
+}
+
+/// The dictation most recently typed, while it can still be taken back.
+#[derive(Debug, Clone)]
+struct LastDictation {
+    text: String,
+    window_id: String,
+    class: String,
+    at: Instant,
 }
 
 pub struct Router {
     executor: Arc<Executor>,
     grammar: Arc<Grammar>,
     judge: Option<Arc<Judge>>,
+    flow: Arc<Flow>,
     policy: Policy,
     pending: Confirmations,
+    last: Mutex<Option<LastDictation>>,
     /// How long a confirmation prompt stays answerable.
     confirm_window: Duration,
+    bus: Option<Bus>,
 }
 
 impl Router {
@@ -73,7 +96,9 @@ impl Router {
         executor: Arc<Executor>,
         grammar: Arc<Grammar>,
         judge: Option<Arc<Judge>>,
+        flow: Arc<Flow>,
         confirm_window: Duration,
+        bus: Option<Bus>,
     ) -> Self {
         let policy = judge
             .as_ref()
@@ -82,9 +107,12 @@ impl Router {
             executor,
             grammar,
             judge,
+            flow,
             policy,
             pending: Confirmations::default(),
+            last: Mutex::new(None),
             confirm_window,
+            bus,
         }
     }
 
@@ -93,21 +121,65 @@ impl Router {
         &self.policy
     }
 
-    /// Handle a finished transcript. Returns a short human-readable result
-    /// (used for notification/TTS); Err for failures.
-    pub async fn handle(&self, mode: Mode, transcript: &str) -> anyhow::Result<Handled> {
+    pub fn flow(&self) -> &Flow {
+        &self.flow
+    }
+
+    fn progress(&self, state: State, mode: Mode) {
+        if let Some(bus) = &self.bus {
+            bus.set_state(state, Some(mode));
+        }
+    }
+
+    /// Handle a finished transcript. `focused` is the window that had focus
+    /// when the capture started, so dictation is shaped for where it lands.
+    pub async fn handle(
+        &self,
+        mode: Mode,
+        transcript: &str,
+        focused: Option<&Window>,
+    ) -> anyhow::Result<Handled> {
         let transcript = transcript.trim();
         anyhow::ensure!(!transcript.is_empty(), "empty transcript");
         match mode {
             // Dictation is not an answer: a pending prompt survives it.
-            Mode::Dictate => self.executor.type_text(transcript).await.map(Handled::Done),
-            Mode::Command => self.route_command(transcript).await,
+            Mode::Dictate => self.dictate(transcript, focused).await,
+            Mode::Command => self.route_command(transcript, focused).await,
         }
+    }
+
+    async fn dictate(&self, transcript: &str, focused: Option<&Window>) -> anyhow::Result<Handled> {
+        let class = focused.map(|w| w.class.as_str()).unwrap_or_default();
+        self.progress(State::Thinking, Mode::Dictate);
+        let processed = self.flow.process(transcript, class).await;
+        self.progress(State::Typing, Mode::Dictate);
+        self.executor.type_text(&processed.text).await?;
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastDictation {
+            text: processed.text.clone(),
+            window_id: focused.map(|w| w.id.clone()).unwrap_or_default(),
+            class: class.to_string(),
+            at: Instant::now(),
+        });
+        Ok(Handled::Typed(processed))
+    }
+
+    /// The last dictation, if it is recent and the focus has not moved.
+    fn recent_dictation(&self, focused: Option<&Window>) -> Option<LastDictation> {
+        let last = self
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        if last.at.elapsed() > self.flow.edit_window() {
+            return None;
+        }
+        let same_window = focused.is_none_or(|w| w.id == last.window_id);
+        same_window.then_some(last)
     }
 
     /// Read the state the judged path needs. Public so `parlad --judge` can
     /// use the same observation instead of its own copy.
-    pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+    pub async fn snapshot(&self, focused: Option<&Window>) -> anyhow::Result<Snapshot> {
         let windows = self
             .executor
             .list_windows()
@@ -125,10 +197,15 @@ impl Router {
             current_desktop,
             desktop_count: desktops.len() as u32,
             claude_running: self.executor.tmux().session_exists().await,
+            last_dictation: self.recent_dictation(focused).is_some(),
         })
     }
 
-    async fn route_command(&self, transcript: &str) -> anyhow::Result<Handled> {
+    async fn route_command(
+        &self,
+        transcript: &str,
+        focused: Option<&Window>,
+    ) -> anyhow::Result<Handled> {
         let intent = self.grammar.parse(transcript);
         // A reply is checked before anything else, so "yes" can never be
         // read as a command; any other command-mode utterance drops the
@@ -150,6 +227,9 @@ impl Router {
 
         if let Some(intent) = intent {
             tracing::info!("fast path: {intent:?}");
+            if let Intent::ScratchThat = intent {
+                return self.scratch(focused).await;
+            }
             let command = from_intent(intent.clone())
                 .context("grammar produced a reply where a command was expected")?;
             return self
@@ -162,16 +242,22 @@ impl Router {
         let Some(judge) = &self.judge else {
             anyhow::bail!("no fast-path match for {transcript:?} (judged path disabled)");
         };
-        self.route_judged(judge, transcript).await
+        self.route_judged(judge, transcript, focused).await
     }
 
-    async fn route_judged(&self, judge: &Judge, transcript: &str) -> anyhow::Result<Handled> {
+    async fn route_judged(
+        &self,
+        judge: &Judge,
+        transcript: &str,
+        focused: Option<&Window>,
+    ) -> anyhow::Result<Handled> {
         // Observed facts the judgment needs. Gathered here rather than inside
         // the judge so the judge stays a pure function of the state it is
         // given, and so a failure to observe is a router error, not a fact.
-        let snapshot = self.snapshot().await?;
+        let snapshot = self.snapshot(focused).await?;
         let ctx = snapshot.context(self.executor.desktop_index());
 
+        self.progress(State::Thinking, Mode::Command);
         match judge.judge_verdict(transcript, &ctx).await? {
             Verdict::Act(resolved) => {
                 tracing::info!(
@@ -183,6 +269,9 @@ impl Router {
                 let source = format!("judged (confidence {:.2})", resolved.confidence);
                 let intent = resolved.intent.clone();
                 let signals = resolved.signals.clone();
+                if let Intent::EditText { instruction } = &intent {
+                    return self.edit(instruction, &signals, focused).await;
+                }
                 let command =
                     from_resolved(resolved).context("judge produced a reply, not a command")?;
                 self.dispatch(&source, &intent, &signals, command).await
@@ -198,6 +287,59 @@ impl Router {
         }
     }
 
+    /// "scratch that": take back the last dictation, if it is still recent
+    /// and the focus has not moved, by deleting as many characters as were
+    /// typed.
+    async fn scratch(&self, focused: Option<&Window>) -> anyhow::Result<Handled> {
+        let last = self
+            .recent_dictation(focused)
+            .ok_or_else(|| anyhow::anyhow!("nothing recent to take back"))?;
+        self.progress(State::Typing, Mode::Command);
+        let n = last.text.chars().count();
+        self.executor.backspace(n).await?;
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        Ok(Handled::Done(format!("took back {n} characters")))
+    }
+
+    /// A spoken instruction about the last dictation: rewrite it with the
+    /// cleanup model and replace what was typed. Editing one's own words of
+    /// a moment ago is harmless and redoable, so a confident judgment acts
+    /// without a prompt; an unconfident one is refused rather than asked.
+    async fn edit(
+        &self,
+        instruction: &str,
+        signals: &Signals,
+        focused: Option<&Window>,
+    ) -> anyhow::Result<Handled> {
+        let last = self
+            .recent_dictation(focused)
+            .ok_or_else(|| anyhow::anyhow!("nothing recent to edit"))?;
+        let intent = Intent::EditText {
+            instruction: instruction.to_string(),
+        };
+        if let Decision::Refuse { reason } = self.policy.decide(&intent, signals) {
+            anyhow::bail!("edit refused: {reason}");
+        }
+        self.progress(State::Thinking, Mode::Command);
+        let text = self.flow.edit(&last.text, instruction, &last.class).await?;
+        if text == last.text {
+            return Ok(Handled::Done("nothing to change".into()));
+        }
+        self.progress(State::Typing, Mode::Command);
+        self.executor.backspace(last.text.chars().count()).await?;
+        self.executor.type_text(&text).await?;
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastDictation {
+            text: text.clone(),
+            at: Instant::now(),
+            ..last
+        });
+        Ok(Handled::Typed(Processed {
+            text,
+            outcome: "edited",
+            profile: String::new(),
+        }))
+    }
+
     /// The single gate. Voice is an unauthenticated input channel, so
     /// nothing the policy wants confirmed runs before the user has said yes
     /// to a prompt naming exactly what will happen.
@@ -209,7 +351,10 @@ impl Router {
         command: Command,
     ) -> anyhow::Result<Handled> {
         match self.policy.decide(intent, signals) {
-            Decision::Act => self.executor.execute(command).await.map(Handled::Done),
+            Decision::Act => {
+                self.progress(State::Typing, Mode::Command);
+                self.executor.execute(command).await.map(Handled::Done)
+            }
             Decision::Confirm { reason } => self.ask(command, reason).await,
             Decision::Refuse { reason } => anyhow::bail!("{source} {intent:?} refused: {reason}"),
         }
@@ -235,7 +380,10 @@ impl Router {
         if let Some(p) = replaced {
             tracing::info!("dropped unconfirmed {}: newer prompt", p.describe);
         }
-        Ok(Handled::Confirm(format!("{}? say yes", capitalize(&describe))))
+        Ok(Handled::Confirm(format!(
+            "{}? say yes",
+            capitalize(&describe)
+        )))
     }
 
     /// "yes": run the parked command if it is still in time and its window
@@ -243,10 +391,9 @@ impl Router {
     async fn confirm(&self) -> anyhow::Result<Handled> {
         let pending = match self.pending.take(Instant::now()) {
             Taken::Nothing => anyhow::bail!("nothing to confirm"),
-            Taken::Expired(p) => anyhow::bail!(
-                "too late to confirm {} (say the command again)",
-                p.describe
-            ),
+            Taken::Expired(p) => {
+                anyhow::bail!("too late to confirm {} (say the command again)", p.describe)
+            }
             Taken::Live(p) => p,
         };
         let command = match pending.command.window_target() {
@@ -262,6 +409,7 @@ impl Router {
             None => pending.command,
         };
         tracing::info!("confirmed: {} ({})", pending.describe, pending.reason);
+        self.progress(State::Typing, Mode::Command);
         self.executor.execute(command).await.map(Handled::Done)
     }
 }

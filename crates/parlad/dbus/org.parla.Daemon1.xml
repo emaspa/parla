@@ -1,0 +1,114 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  parlad on the session bus. Well-known name: org.parla.Daemon
+  Object path: /org/parla/Daemon
+
+  The daemon owns the pipeline; the UI is a client. Editable data
+  (dictionary, snippets, app profiles) lives in TOML files the UI writes
+  directly, then calls Reload. History is read through the daemon.
+
+  All JSON strings are UTF-8 serde_json output of the parla-flow types:
+    Record  { id, at_ms, mode, app, title, raw, text, profile, words,
+              audio_ms, latency_ms, outcome, detail }
+    Stats   { utterances, words, audio_ms, words_per_minute,
+              days: [{ date: "YYYY-MM-DD", utterances, words }] }  (30 days, oldest first)
+-->
+<node>
+  <interface name="org.parla.Daemon1">
+    <!--
+      What the daemon is doing right now:
+        "idle"         waiting for a hotkey
+        "recording"    capturing audio (Mode says which kind)
+        "transcribing" whisper is running
+        "thinking"     the cleanup model or the judge is running
+        "typing"       text is being injected
+        "waiting"      a confirmation prompt is up ("Close X? say yes")
+        "paused"       the session is locked, or Enabled is false
+    -->
+    <property name="State" type="s" access="read"/>
+    <!-- "dictate", "command", or "" when idle -->
+    <property name="Mode" type="s" access="read"/>
+    <!-- Setting false ignores hotkeys until set true again. -->
+    <property name="Enabled" type="b" access="readwrite"/>
+    <!-- The last thing that happened, for the overlay: "typed 12 words",
+         "Launched Firefox", an error message. Cleared on the next capture. -->
+    <property name="LastResult" type="s" access="read"/>
+    <!-- Whether the last result was an error. -->
+    <property name="LastResultIsError" type="b" access="read"/>
+    <!-- Version string of the daemon. -->
+    <property name="Version" type="s" access="read"/>
+    <!-- "local Qwen3-4B-Instruct-2507-Q4_K_M", "typesafe jev-latest", "" when disabled -->
+    <property name="Judge" type="s" access="read"/>
+    <!-- Same for the dictation cleanup model, "" when cleanup is off. -->
+    <property name="Cleanup" type="s" access="read"/>
+    <!-- Hotkey chords as configured, e.g. "ctrl+space". -->
+    <property name="DictateHotkey" type="s" access="read"/>
+    <property name="CommandHotkey" type="s" access="read"/>
+
+    <!-- Start a hands-free capture, mode "dictate" or "command"; it runs
+         until Stop() or the hold limit. Errors if one is already running. -->
+    <method name="Start">
+      <arg name="mode" type="s" direction="in"/>
+    </method>
+    <!-- End the running capture and process it, as releasing the key would. -->
+    <method name="Stop"/>
+    <!-- Drop the running capture without processing it. -->
+    <method name="Cancel"/>
+    <!-- Re-read dictionary.toml, snippets.toml and apps.toml. Errors name
+         the file and the parse problem. -->
+    <method name="Reload"/>
+    <!-- Newest `limit` history records after skipping `offset`, newest
+         first, as a JSON array of Record. -->
+    <method name="History">
+      <arg name="limit" type="u" direction="in"/>
+      <arg name="offset" type="u" direction="in"/>
+      <arg name="records" type="s" direction="out"/>
+    </method>
+    <method name="DeleteHistory">
+      <arg name="id" type="s" direction="in"/>
+      <arg name="existed" type="b" direction="out"/>
+    </method>
+    <method name="ClearHistory"/>
+    <!-- Stats JSON, see above. -->
+    <method name="Stats">
+      <arg name="stats" type="s" direction="out"/>
+    </method>
+    <!-- JSON object of absolute paths the UI may edit or show:
+         { config, dictionary, snippets, apps, history } -->
+    <method name="Paths">
+      <arg name="paths" type="s" direction="out"/>
+    </method>
+    <!-- Run the dictation cleanup on `text` as if it had been dictated
+         into a window of class `app`, without typing anything. For the UI's
+         "try it" box. Returns the cleaned text. -->
+    <method name="Preview">
+      <arg name="text" type="s" direction="in"/>
+      <arg name="app" type="s" direction="in"/>
+      <arg name="cleaned" type="s" direction="out"/>
+    </method>
+
+    <signal name="StateChanged">
+      <arg name="state" type="s"/>
+      <arg name="mode" type="s"/>
+    </signal>
+    <!-- Microphone level while recording, 0.0 to 1.0, about 25 times a
+         second. Nothing is sent when not recording. -->
+    <signal name="Level">
+      <arg name="level" type="d"/>
+    </signal>
+    <!-- A history Record as JSON, emitted when an utterance has finished
+         (typed, executed, refused or failed). -->
+    <signal name="Utterance">
+      <arg name="record" type="s"/>
+    </signal>
+    <!-- Something the user should see: a failure, a refusal. -->
+    <signal name="Error">
+      <arg name="message" type="s"/>
+    </signal>
+    <!-- A confirmation prompt is up and waits for a spoken yes/no. -->
+    <signal name="Confirm">
+      <arg name="question" type="s"/>
+    </signal>
+  </interface>
+</node>

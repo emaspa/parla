@@ -38,6 +38,10 @@ pub enum Intent {
     Notify { text: String },
     /// Send a raw key chord to the focused window (e.g. "ctrl s").
     Key { chord: String },
+    /// Delete the text just dictated ("scratch that").
+    ScratchThat,
+    /// Change the text just dictated as instructed ("make that formal").
+    EditText { instruction: String },
     /// "yes": carry out the action the router is waiting to confirm.
     Confirm,
     /// "no": drop the action the router is waiting to confirm.
@@ -89,6 +93,8 @@ impl Intent {
             "claude_read" => Intent::ClaudeRead,
             "notify" => Intent::Notify { text: get("text")? },
             "key" => Intent::Key { chord: get("chord")? },
+            "scratch_that" => Intent::ScratchThat,
+            "edit_text" => Intent::EditText { instruction: get("instruction")? },
             "confirm" => Intent::Confirm,
             "deny" => Intent::Deny,
             _ => {

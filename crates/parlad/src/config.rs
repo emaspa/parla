@@ -37,20 +37,22 @@ pub struct DaemonConfig {
     pub audio: AudioConfig,
     pub asr: AsrConfig,
     pub router: RouterConfig,
-    pub typesafe: TypeSafeConfig,
+    /// The GGUF model both the judged path and dictation cleanup share.
+    pub local: LocalConfig,
+    pub judge: JudgeConfig,
+    pub flow: FlowConfig,
     pub desktopd: desktopd::DesktopdConfig,
 }
 
 /// The judged path: what happens to utterances the grammar rejects.
+/// `backend = "local"` uses the model under `[local]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct TypeSafeConfig {
+pub struct JudgeConfig {
     /// Judge utterances the fast-path grammar does not match.
     pub enabled: bool,
-    /// API key. Prefer leaving this empty and exporting TYPESAFE_API_KEY, so
-    /// the key stays out of a config file that gets copied around.
-    pub api_key: Option<Secret>,
-    pub model: String,
+    /// Who answers: the model under `[local]`, or the TypeSafe API.
+    pub backend: Backend,
     /// Give up rather than keep the user waiting on a voice command.
     pub timeout_ms: u64,
     /// Below this intent confidence, act on nothing.
@@ -62,28 +64,98 @@ pub struct TypeSafeConfig {
     pub dictation_threshold: f64,
     /// `is_destructive` at or above this forces spoken confirmation.
     pub destructive_threshold: f64,
-    /// Include window titles in what the judged path sends to the API. Off by
-    /// default: titles carry document names, URLs and chat subjects, so the
-    /// request then names only each window's application and an index, and
-    /// the title is mapped back on this machine.
+    /// Include window titles in what the judged path sends off the machine.
+    /// Only the `typesafe` backend consults this: titles carry document
+    /// names, URLs and chat subjects, so by default the request names only
+    /// each window's application and an index, and the title is mapped back
+    /// here. The local backend always sees titles; nothing leaves the host.
     pub send_window_titles: bool,
+    pub typesafe: TypeSafeConfig,
 }
 
-impl Default for TypeSafeConfig {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// A GGUF model loaded through llama.cpp on this machine.
+    Local,
+    /// The TypeSafe System One API, over HTTPS.
+    TypeSafe,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Backend::Local => "local",
+            Backend::TypeSafe => "typesafe",
+        })
+    }
+}
+
+/// The local model: llama.cpp with a GGUF on the GPU. Loaded once and
+/// shared by the judged path and dictation cleanup when either names the
+/// `local` backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalConfig {
+    /// Path to a GGUF instruct model. A 3–4B model at Q4 fits next to
+    /// whisper on an 8 GB card.
+    pub model_path: PathBuf,
+    /// Layers to offload to the GPU. More than the model has means all of
+    /// them; 0 keeps the model on the CPU.
+    pub gpu_layers: u32,
+    /// Context size in tokens. One utterance's prompt is the desktop state
+    /// plus one question, a few thousand tokens on a busy desktop.
+    pub context_tokens: u32,
+    /// CPU threads for whatever is not offloaded.
+    pub threads: usize,
+}
+
+/// The TypeSafe backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TypeSafeConfig {
+    /// API key. Prefer leaving this empty and exporting TYPESAFE_API_KEY, so
+    /// the key stays out of a config file that gets copied around.
+    pub api_key: Option<Secret>,
+    pub model: String,
+}
+
+impl Default for JudgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            api_key: None,
-            model: "jev-latest".into(),
-            timeout_ms: 2_500,
+            enabled: true,
+            backend: Backend::Local,
+            timeout_ms: 4_000,
             // Starting points only: these want tuning against real
             // utterances, plotting confidence against whether the action
-            // was the one wanted.
+            // was the one wanted. A local model's probabilities are not
+            // calibrated like TypeSafe's, so each backend wants its own.
             min_confidence: 0.45,
             act_unconfirmed_above: 0.75,
             dictation_threshold: 0.5,
             destructive_threshold: 0.6,
             send_window_titles: false,
+            typesafe: TypeSafeConfig::default(),
+        }
+    }
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        Self {
+            model_path: dirs_model().join("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+            gpu_layers: 999,
+            context_tokens: 8_192,
+            threads: 4,
+        }
+    }
+}
+
+impl Default for TypeSafeConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: "jev-latest".into(),
         }
     }
 }
@@ -101,8 +173,102 @@ impl TypeSafeConfig {
             .map(|k| k.expose().to_string())
             .filter(|k| !k.trim().is_empty())
             .ok_or_else(|| {
-                anyhow::anyhow!("no TypeSafe API key (set TYPESAFE_API_KEY or typesafe.api_key)")
+                anyhow::anyhow!(
+                    "no TypeSafe API key (set TYPESAFE_API_KEY or judge.typesafe.api_key)"
+                )
             })
+    }
+}
+
+/// Dictation: what happens to a transcript before it is typed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlowConfig {
+    /// Run the cleanup model over dictation: filler words out, self-
+    /// corrections applied, punctuation fixed, the app's tone applied.
+    /// Off types what whisper heard, after dictionary replacements.
+    pub cleanup: bool,
+    /// Who rewrites: the model under `[local]`, or an OpenAI-compatible
+    /// chat completions endpoint.
+    pub backend: FlowBackend,
+    /// Give up on cleanup and type the raw transcript after this long.
+    pub timeout_ms: u64,
+    /// Most tokens the model may produce for one dictation.
+    pub max_tokens: u32,
+    /// Keep a history of dictations and commands in
+    /// `$XDG_DATA_HOME/parla/history.jsonl` for the UI.
+    pub history: bool,
+    /// How long after a dictation "scratch that" or "make that formal"
+    /// still refer to it.
+    pub edit_window_ms: u64,
+    pub openai: OpenAiConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowBackend {
+    Local,
+    OpenAi,
+}
+
+impl std::fmt::Display for FlowBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FlowBackend::Local => "local",
+            FlowBackend::OpenAi => "openai",
+        })
+    }
+}
+
+/// Any server speaking the OpenAI chat completions API: OpenAI itself,
+/// OpenRouter, Groq, or a local llama-server or Ollama.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenAiConfig {
+    /// Base URL up to and excluding `/chat/completions`.
+    pub base_url: String,
+    /// Prefer exporting OPENAI_API_KEY instead.
+    pub api_key: Option<Secret>,
+    pub model: String,
+}
+
+impl Default for FlowConfig {
+    fn default() -> Self {
+        Self {
+            cleanup: true,
+            backend: FlowBackend::Local,
+            timeout_ms: 6_000,
+            max_tokens: 1_024,
+            history: true,
+            edit_window_ms: 90_000,
+            openai: OpenAiConfig::default(),
+        }
+    }
+}
+
+impl Default for OpenAiConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: None,
+            model: "gpt-4.1-mini".into(),
+        }
+    }
+}
+
+impl OpenAiConfig {
+    /// Environment wins over the config file. A local server may need no
+    /// key at all, so an absent key is an empty string, not an error.
+    pub fn resolved_api_key(&self) -> String {
+        if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+            if !k.trim().is_empty() {
+                return k;
+            }
+        }
+        self.api_key
+            .as_ref()
+            .map(|k| k.expose().to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -284,21 +450,34 @@ impl DaemonConfig {
         crate::hotkeys::parse_chord(&self.hotkeys.command)
             .map_err(|e| anyhow::anyhow!("hotkeys.command: {e}"))?;
 
-        let t = &self.typesafe;
-        anyhow::ensure!(t.timeout_ms > 0, "typesafe.timeout_ms must be > 0");
+        let j = &self.judge;
+        anyhow::ensure!(j.timeout_ms > 0, "judge.timeout_ms must be > 0");
         for (name, v) in [
-            ("typesafe.min_confidence", t.min_confidence),
-            ("typesafe.act_unconfirmed_above", t.act_unconfirmed_above),
-            ("typesafe.dictation_threshold", t.dictation_threshold),
-            ("typesafe.destructive_threshold", t.destructive_threshold),
+            ("judge.min_confidence", j.min_confidence),
+            ("judge.act_unconfirmed_above", j.act_unconfirmed_above),
+            ("judge.dictation_threshold", j.dictation_threshold),
+            ("judge.destructive_threshold", j.destructive_threshold),
         ] {
             check_unit(name, v)?;
         }
         anyhow::ensure!(
-            t.min_confidence <= t.act_unconfirmed_above,
-            "typesafe.min_confidence ({}) exceeds typesafe.act_unconfirmed_above ({})",
-            t.min_confidence,
-            t.act_unconfirmed_above
+            j.min_confidence <= j.act_unconfirmed_above,
+            "judge.min_confidence ({}) exceeds judge.act_unconfirmed_above ({})",
+            j.min_confidence,
+            j.act_unconfirmed_above
+        );
+        anyhow::ensure!(
+            self.local.context_tokens >= 512,
+            "local.context_tokens must be at least 512"
+        );
+        anyhow::ensure!(self.local.threads > 0, "local.threads must be > 0");
+
+        let fl = &self.flow;
+        anyhow::ensure!(fl.timeout_ms > 0, "flow.timeout_ms must be > 0");
+        anyhow::ensure!(fl.max_tokens > 0, "flow.max_tokens must be > 0");
+        anyhow::ensure!(
+            !fl.openai.base_url.trim().is_empty(),
+            "flow.openai.base_url must not be empty"
         );
         Ok(())
     }
@@ -354,8 +533,11 @@ mod tests {
         c.audio.speech_threshold = 1.5;
         assert!(c.validate().is_err());
         let mut c = DaemonConfig::default();
-        c.typesafe.min_confidence = 0.9;
-        c.typesafe.act_unconfirmed_above = 0.5;
+        c.judge.min_confidence = 0.9;
+        c.judge.act_unconfirmed_above = 0.5;
+        assert!(c.validate().is_err());
+        let mut c = DaemonConfig::default();
+        c.local.context_tokens = 16;
         assert!(c.validate().is_err());
         let mut c = DaemonConfig::default();
         c.audio.min_utterance_ms = 40_000;
@@ -380,5 +562,17 @@ mod tests {
         assert!(!toml.contains("sk-live"), "{toml}");
         let parsed: TypeSafeConfig = toml::from_str("api_key = \"abc\"").unwrap();
         assert_eq!(parsed.api_key.as_ref().unwrap().expose(), "abc");
+    }
+
+    #[test]
+    fn backend_is_spelled_in_lowercase() {
+        let cfg: DaemonConfig = toml::from_str("[judge]\nbackend = \"typesafe\"\n").unwrap();
+        assert_eq!(cfg.judge.backend, Backend::TypeSafe);
+        let text = DaemonConfig::default_toml().unwrap();
+        assert!(text.contains("backend = \"local\""), "{text}");
+        assert!(text.contains("[local]"), "{text}");
+        assert!(text.contains("[flow.openai]"), "{text}");
+        let cfg: DaemonConfig = toml::from_str("[flow]\nbackend = \"openai\"\n").unwrap();
+        assert_eq!(cfg.flow.backend, FlowBackend::OpenAi);
     }
 }

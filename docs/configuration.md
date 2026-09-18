@@ -197,10 +197,10 @@ list of options.
 enabled = true
 backend = "local"
 timeout_ms = 4000
-min_confidence = 0.45
-act_unconfirmed_above = 0.75
-dictation_threshold = 0.5
-destructive_threshold = 0.6
+min_confidence = 0.35
+act_unconfirmed_above = 0.65
+dictation_threshold = 0.4
+destructive_threshold = 0.8
 send_window_titles = false
 
 [judge.typesafe]
@@ -217,10 +217,26 @@ has already given up on.
 
 The four thresholds are probabilities the policy compares against. They are
 described with the decision procedure in [commands.md](commands.md). Each
-must be within 0 and 1, and `min_confidence` must not exceed
-`act_unconfirmed_above`. The defaults were picked for TypeSafe's calibrated
-outputs and have not been re-measured for the local model, whose
-probabilities cluster at 0 and 1.
+is optional. A key that is absent takes the default for the backend in
+use, so a config that only sets `backend = "typesafe"` gets the TypeSafe
+numbers without naming them, and a key that is set wins for that key
+alone. Each must be within 0 and 1, and `min_confidence` must not exceed
+`act_unconfirmed_above` after the defaults are applied.
+
+| key | `local` | `typesafe` |
+| --- | --- | --- |
+| `min_confidence` | 0.35 | 0.45 |
+| `act_unconfirmed_above` | 0.65 | 0.75 |
+| `dictation_threshold` | 0.4 | 0.5 |
+| `destructive_threshold` | 0.8 | 0.6 |
+
+The local numbers come from `parlad --calibrate` over the corpus in
+`corpus/judge.toml`. The method and the results are in
+[commands.md](commands.md). The TypeSafe numbers were picked by hand for
+that API's calibrated outputs and have not been run against the corpus.
+`--print-default-config` prints the four keys with the local values,
+since `local` is the default backend, and `--check` prints the values in
+force.
 
 `send_window_titles` only affects the `typesafe` backend. By default the
 request names each open window by its application class and an index, and

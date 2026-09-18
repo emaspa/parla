@@ -97,6 +97,11 @@ model assigns to replying with exactly that key. `backend = "typesafe"`
 under `[judge]` sends the same questions to the TypeSafe System One API
 instead, with window titles kept on this machine unless allowed.
 
+`parlad --calibrate corpus/judge.toml` runs a corpus of utterances through
+the judge against a synthetic desktop and reports the accuracy and the
+thresholds that score best. The policy's defaults for the local model
+come from it.
+
 ## The UI
 
 ![The overlay pill while parla listens](docs/img/overlay-listening.png)
@@ -159,10 +164,6 @@ list, is in [docs/getting-started.md](docs/getting-started.md).
 
 ## Not done yet
 
-- **The judged path's thresholds are guesses.** They were hand-picked for
-  the TypeSafe backend and never checked against a corpus of real
-  utterances, on either backend. The local model's probabilities cluster
-  at 0 and 1, which makes them blunt.
 - **The dictionary does not learn.** A correction you type after a
   dictation is not noticed. Names go into the dictionary by hand.
 - **The daemon and the UI have run together only against the mock.** The

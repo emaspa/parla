@@ -140,8 +140,9 @@ utterance against a 12-window desktop took 700 ms and about 2000 prompt
 tokens.
 
 A 4B model's probabilities are peaky. Most answers come back at 1.00 or
-0.00. That makes the thresholds below blunt instruments with this backend,
-and they have not been re-measured for it.
+0.00, and a wrong answer is as confident as a right one, so the thresholds
+below separate little with this backend. "Calibrating the thresholds"
+has the measurements.
 
 ### The TypeSafe backend
 
@@ -169,6 +170,11 @@ asked anything, so only the intent's own rule applies: `close_window`,
 acts. Closing can discard unsaved state, a shortcut and a key chord can do
 anything, and a message to Claude Code makes an agent act on it.
 
+The four thresholds are per backend. A key left out of `[judge]` takes
+the backend's default: for `local` 0.35, 0.65, 0.4 and 0.8; for `typesafe`
+0.45, 0.75, 0.5 and 0.6. The local numbers come from the calibration run
+below.
+
 For a judged intent, the checks run in this order and the first that
 applies wins:
 
@@ -187,6 +193,92 @@ applies wins:
 
 Being confident that parla understood a destructive request is not
 permission to carry it out, which is why step 5 comes before step 7.
+
+## Calibrating the thresholds
+
+```
+parlad --calibrate corpus/judge.toml
+```
+
+runs every case in a corpus through the judge and prints how the model
+did and which thresholds would score best. The corpus is a TOML file with
+a `[state]` block describing a synthetic desktop (installed applications,
+open windows, desktop count, current desktop, whether Claude Code runs)
+and a list of `[[case]]` entries, each an utterance with what the judge
+ought to make of it: an intent name, or `dictation` for prose, or
+`unclear` for what should be refused, plus the target, desktop number,
+direction, payload or model the intent must carry. The comment at the top
+of `corpus/judge.toml` lists every field. The desktop is the corpus's, not
+the machine's. The tool builds no executor, opens no bus, and sends no
+notification. It does load the model the config names, so a run takes the
+same GPU memory as the daemon. Progress goes to stderr, the report to
+stdout.
+
+The tool reports and skips a case the grammar matches, since it never
+reaches the judge. Every other case prints one line:
+
+```
+ok    show_app  show_app  target ok  conf 1.00 dict 0.00 destr 0.00 act  "bring up firefox"  ["GitHub - Mozilla Firefox"]
+WRONG key       key                  conf 1.00 dict 0.00 destr 0.00 ask  "hit control s"     ["hit control s"]
+```
+
+In order: whether the verdict was right in every respect the case names;
+the expected intent; the intent the judge built (`unclear` when none
+could be); whether the target resolved to the one named; the weakest-link
+confidence; the `is_dictation` and `is_destructive` probabilities; what
+the policy would do under the thresholds in force (`act`, `ask`, or
+`refuse` with its reason); the utterance; and the resolved target or
+argument. A case that expects a refusal counts as right when the daemon
+would refuse it for any reason. Whether the model recognised prose as
+prose is a separate line in the summary.
+
+The summary gives intent accuracy over the cases that expect an action,
+target accuracy over the cases that name one, how many refusals happened
+as expected, dictation precision and recall at the current threshold, a
+histogram of the confidence behind right and wrong verdicts, and a sweep.
+The sweep tries every `min_confidence` and `act_unconfirmed_above` pair
+from 0.05 to 0.95 in steps of 0.05 and scores each as correct unconfirmed
+acts, minus five per wrong unconfirmed act, minus one per correct verdict
+that asked, minus two per correct verdict that was refused. The report
+prints the best pair with the rows around it, and picks the middle of a
+tie. It suggests `dictation_threshold` from the F1 of `is_dictation`
+against the prose cases, and `destructive_threshold` from
+`is_destructive` against the cases that say whether they are destructive,
+taking the low end of a tie there because a missed prompt costs more than
+a needless one.
+
+Measured on 2026-09-18 with Qwen3-4B-Instruct-2507-Q4_K_M on an RTX 5060,
+corpus of 135 cases, none matched by the grammar:
+
+```
+right in every respect: 99/135 (73%)
+intent accuracy:     82/101 (81%) on cases that expect an action; with arguments 66/101
+target accuracy:     30/42 (71%) on cases that name a target
+refusals:            34/34 (100%) of cases that expect a refusal got one
+prose:               14/14 refused, 6 of them recognised as dictation
+dictation detection: precision 1.00 recall 0.43 at dictation_threshold 0.40
+best score -12 at min_confidence 0.35, act_unconfirmed_above 0.65
+at the best pair: acts right 49, acts WRONG 9, asks right 16, asks wrong 18, refuses right 0
+```
+
+The local defaults are that pair, 0.4 for dictation and 0.8 for
+destructive. Two things the numbers say about this model. The confidence
+carries little. 59 of 65 right verdicts and 22 of 27 wrong ones score
+above 0.9, and any floor between 0.05 and 0.65 scores the same, so 0.35
+is the middle of that range rather than a measured edge. And the errors
+are systematic rather than uncertain. The model answers the payload
+question with the whole utterance for every `notify`, `key` and `krunner`
+case and for half of the `claude_tell` cases, so "hit control s" resolves
+to the chord "hit control s". It picks "no target" for "fire up gimp" with
+GIMP on the list. It calls eight of the fourteen prose cases not a
+command rather than dictation. It calls starting Claude Code or opening a
+shell destructive at 1.00. Those are for the questions and the model to
+fix, and no threshold moves them. The corpus has not been run with the
+TypeSafe backend.
+
+To add a case, put it in `corpus/judge.toml` and rerun. The report says
+whether the grammar took it first. Keep the cases the model gets wrong,
+so a change to a question or a model can be measured against them.
 
 ## Confirmation
 

@@ -169,6 +169,12 @@ impl DesktopIndex {
             Self::load_dir(&applications, &applications, &mut entries, &mut seen);
         }
         tracing::info!("desktop index: {} entries", entries.len());
+        Self::from_entries(entries)
+    }
+
+    /// An index over entries built elsewhere: a synthetic desktop for a
+    /// calibration run, or a test. Nothing is read from disk.
+    pub fn from_entries(entries: Vec<DesktopEntry>) -> Self {
         Self {
             entries,
             matcher: SkimMatcherV2::default(),

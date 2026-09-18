@@ -92,6 +92,23 @@ pub enum Verdict {
     Unclear(String),
 }
 
+/// A verdict together with the raw signals it was built from, for
+/// `parlad --calibrate`. The verdict here is composed without the
+/// dictation gate: a case the model calls prose still shows which intent
+/// it would have built, and the caller applies whichever dictation
+/// threshold it is measuring to `dictation` itself.
+#[derive(Debug)]
+pub struct Detailed {
+    pub verdict: Verdict,
+    /// Probability of yes to `is_dictation`, before any threshold.
+    pub dictation: Option<f64>,
+    /// Probability of yes to `is_destructive`, before any threshold.
+    pub destructive: Option<f64>,
+    /// The intent key the model ranked first and its probability, whatever
+    /// became of it; the no-match sentinel when it chose that.
+    pub intent: Option<(String, f64)>,
+}
+
 pub struct Judge {
     oracle: Oracle,
     policy: Policy,
@@ -149,6 +166,21 @@ impl Judge {
     }
 
     pub async fn judge_verdict(&self, utterance: &str, ctx: &Context<'_>) -> anyhow::Result<Verdict> {
+        let d = self.judge_verdict_detailed(utterance, ctx).await?;
+        Ok(if self.policy.is_prose(d.dictation) {
+            Verdict::Dictation
+        } else {
+            d.verdict
+        })
+    }
+
+    /// [`Self::judge_verdict`] plus the probabilities behind it; see
+    /// [`Detailed`] for what is and is not applied.
+    pub async fn judge_verdict_detailed(
+        &self,
+        utterance: &str,
+        ctx: &Context<'_>,
+    ) -> anyhow::Result<Detailed> {
         let candidates = Candidates::build(utterance, ctx, self.send_window_titles);
         let state = candidates.state(utterance, ctx);
 
@@ -167,27 +199,29 @@ impl Judge {
             tracing::debug!("answer {id}: {}", candidates.describe(answer));
         }
 
-        Ok(compose(&resp, &self.policy, &candidates))
+        Ok(Detailed {
+            verdict: compose(&resp, &candidates),
+            dictation: resp.noul("is_dictation"),
+            destructive: resp.noul("is_destructive"),
+            intent: resp.choice("intent").map(|(k, p)| (k.to_string(), p)),
+        })
     }
 }
 
 /// Turn the answers into an intent plus the signals that gate it. No
-/// threshold is applied here except the dictation one, which decides what
-/// kind of answer this is at all; the rest is [`Policy::decide`], so it can
+/// threshold is applied here: whether the utterance was prose, and whether
+/// the intent runs, asks or is refused, is [`Policy::decide`], so this can
 /// be tested against recorded answers without a network call.
-fn compose(resp: &Response, policy: &Policy, cand: &Candidates) -> Verdict {
-    match build(resp, policy, cand) {
+fn compose(resp: &Response, cand: &Candidates) -> Verdict {
+    match build(resp, cand) {
         Ok(v) => v,
         Err(reason) => Verdict::Unclear(reason),
     }
 }
 
-fn build(resp: &Response, policy: &Policy, cand: &Candidates) -> Result<Verdict, String> {
+fn build(resp: &Response, cand: &Candidates) -> Result<Verdict, String> {
     let dictation = resp.noul("is_dictation");
     let destructive = resp.noul("is_destructive");
-    if policy.is_prose(dictation) {
-        return Ok(Verdict::Dictation);
-    }
 
     let (name, intent_conf) = match cand.pick(resp, "intent")? {
         Pick::Chosen(n, c) => (n, c),
@@ -893,7 +927,7 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.03),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        let (got, decision) = act(compose(&r, &cand()));
         assert_eq!(
             got.intent,
             Intent::LaunchApp {
@@ -915,7 +949,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.01),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        let (got, decision) = act(compose(&r, &cand()));
         assert_eq!(got.confidence, 0.50);
         assert!(matches!(decision, Decision::Confirm { .. }));
     }
@@ -930,7 +964,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.02),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        let (got, decision) = act(compose(&r, &cand()));
         assert_eq!(got.intent, Intent::StartClaude { model: None });
         assert_eq!(got.confidence, 0.50);
         assert!(matches!(decision, Decision::Confirm { .. }));
@@ -941,22 +975,23 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.02),
         }));
-        assert!(refused(compose(&r, &policy(), &cand())).contains("0.20"));
+        assert!(refused(compose(&r, &cand())).contains("0.20"));
     }
 
     #[test]
     fn dictation_wins_over_any_intent() {
         // Prose that happens to read like a command must not be executed.
+        // Composition keeps the intent (the calibrator wants to see it);
+        // the policy refuses it, and `judge_verdict` reports Dictation.
         let r = resp(serde_json::json!({
             "intent": choice("show_app", 0.99),
             "target": choice("a:0", 0.99),
             "is_dictation": noul(0.88),
             "is_destructive": noul(0.01),
         }));
-        assert!(matches!(
-            compose(&r, &policy(), &cand()),
-            Verdict::Dictation
-        ));
+        let (got, decision) = act(compose(&r, &cand()));
+        assert!(policy().is_prose(Some(0.88)));
+        assert!(matches!(decision, Decision::Refuse { .. }), "{got:?}");
     }
 
     #[test]
@@ -969,7 +1004,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.91),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        let (got, decision) = act(compose(&r, &cand()));
         assert_eq!(
             got.intent,
             Intent::CloseWindow {
@@ -989,7 +1024,7 @@ mod tests {
             "target": choice(FOCUSED, 0.95),
             "is_dictation": noul(0.01),
         }));
-        let (_, decision) = act(compose(&r, &policy(), &cand()));
+        let (_, decision) = act(compose(&r, &cand()));
         assert!(matches!(decision, Decision::Confirm { .. }));
 
         // Likewise a missing (or wrong-typed) is_dictation answer.
@@ -999,7 +1034,7 @@ mod tests {
             "is_dictation": choice("yes", 0.9),
             "is_destructive": noul(0.01),
         }));
-        let (_, decision) = act(compose(&r, &policy(), &cand()));
+        let (_, decision) = act(compose(&r, &cand()));
         assert!(matches!(decision, Decision::Confirm { .. }));
     }
 
@@ -1013,7 +1048,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.04),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        let (got, decision) = act(compose(&r, &cand()));
         assert_eq!(got.intent, Intent::MinimizeWindow { query: None });
         assert_eq!(decision, Decision::Act);
     }
@@ -1027,14 +1062,14 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.04),
         }));
-        assert!(unclear(compose(&none, &policy(), &cand())).contains("without a target"));
+        assert!(unclear(compose(&none, &cand())).contains("without a target"));
 
         let missing = resp(serde_json::json!({
             "intent": choice("close_window", 0.92),
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.04),
         }));
-        assert!(unclear(compose(&missing, &policy(), &cand())).contains("without a target"));
+        assert!(unclear(compose(&missing, &cand())).contains("without a target"));
     }
 
     #[test]
@@ -1045,7 +1080,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.01),
         }));
-        unclear(compose(&r, &policy(), &cand()));
+        unclear(compose(&r, &cand()));
     }
 
     #[test]
@@ -1054,7 +1089,7 @@ mod tests {
             "intent": choice(NO_TARGET, 0.9),
             "is_dictation": noul(0.1),
         }));
-        unclear(compose(&none, &policy(), &cand()));
+        unclear(compose(&none, &cand()));
 
         // Low confidence with an otherwise complete answer is the policy's
         // refusal.
@@ -1064,7 +1099,7 @@ mod tests {
             "is_dictation": noul(0.1),
             "is_destructive": noul(0.1),
         }));
-        refused(compose(&shaky, &policy(), &cand()));
+        refused(compose(&shaky, &cand()));
     }
 
     #[test]
@@ -1076,7 +1111,7 @@ mod tests {
             "desktop_number": choice(NO_TARGET, 0.99),
             "is_dictation": noul(0.01),
         }));
-        unclear(compose(&r, &policy(), &cand()));
+        unclear(compose(&r, &cand()));
     }
 
     #[test]
@@ -1088,7 +1123,7 @@ mod tests {
             "is_destructive": noul(0.01),
         }));
         // Two desktops were offered, so "3" was never a candidate.
-        assert!(unclear(compose(&r, &policy(), &cand())).contains("never offered"));
+        assert!(unclear(compose(&r, &cand())).contains("never offered"));
 
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop", 0.97),
@@ -1096,7 +1131,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.01),
         }));
-        let (got, _) = act(compose(&r, &policy(), &cand()));
+        let (got, _) = act(compose(&r, &cand()));
         assert_eq!(got.intent, Intent::VirtualDesktop { n: 2 });
     }
 
@@ -1108,7 +1143,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.01),
         }));
-        unclear(compose(&r, &policy(), &cand()));
+        unclear(compose(&r, &cand()));
 
         let r = resp(serde_json::json!({
             "intent": choice("virtual_desktop_rel", 0.97),
@@ -1116,7 +1151,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.01),
         }));
-        let (got, _) = act(compose(&r, &policy(), &cand()));
+        let (got, _) = act(compose(&r, &cand()));
         assert_eq!(got.intent, Intent::VirtualDesktopRel { delta: -1 });
     }
 
@@ -1130,14 +1165,14 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.03),
         }));
-        assert!(unclear(compose(&r, &policy(), &cand())).contains("never offered"));
+        assert!(unclear(compose(&r, &cand())).contains("never offered"));
 
         let r = resp(serde_json::json!({
             "intent": choice("reboot", 0.94),
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.03),
         }));
-        assert!(unclear(compose(&r, &policy(), &cand())).contains("never offered"));
+        assert!(unclear(compose(&r, &cand())).contains("never offered"));
     }
 
     #[test]
@@ -1148,7 +1183,7 @@ mod tests {
             "is_dictation": noul(0.01),
             "is_destructive": noul(0.02),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &cand()));
+        let (got, decision) = act(compose(&r, &cand()));
         assert_eq!(got.intent, Intent::StartClaude { model: None });
         assert_eq!(decision, Decision::Act);
     }
@@ -1162,7 +1197,7 @@ mod tests {
             "is_dictation": noul(0.2),
             "is_destructive": noul(0.05),
         }));
-        let (got, decision) = act(compose(&r, &policy(), &c));
+        let (got, decision) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::ClaudeTell {
@@ -1182,7 +1217,7 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.01),
         }));
-        let (got, _) = act(compose(&r, &policy(), &c));
+        let (got, _) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::KRunner {
@@ -1200,7 +1235,7 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.02),
         }));
-        let (got, _) = act(compose(&r, &policy(), &c));
+        let (got, _) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::FocusWindow {
@@ -1215,7 +1250,7 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.02),
         }));
-        let (got, _) = act(compose(&r, &policy(), &c));
+        let (got, _) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::MinimizeWindow {
@@ -1234,7 +1269,7 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.02),
         }));
-        let (got, _) = act(compose(&r, &policy(), &c));
+        let (got, _) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::LaunchApp {
@@ -1254,7 +1289,7 @@ mod tests {
             "is_dictation": noul(0.02),
             "is_destructive": noul(0.02),
         }));
-        let (got, _) = act(compose(&r, &policy(), &c));
+        let (got, _) = act(compose(&r, &c));
         assert_eq!(
             got.intent,
             Intent::FocusWindow {

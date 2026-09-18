@@ -7,6 +7,7 @@
 
 mod asr;
 mod audio;
+mod calibrate;
 mod command;
 mod config;
 mod confirm;
@@ -66,6 +67,10 @@ async fn main() -> anyhow::Result<()> {
             let utterance = args.get(1..).map(|r| r.join(" ")).unwrap_or_default();
             return judge_once(&utterance).await;
         }
+        Some("--calibrate") => {
+            let path = args.get(1).map_or("corpus/judge.toml", String::as_str);
+            return calibrate::run(std::path::Path::new(path)).await;
+        }
         Some("--flow") => {
             let text = args.get(1).cloned().unwrap_or_default();
             let class = args.get(2).cloned().unwrap_or_default();
@@ -78,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
             return flow_once(&text, Some(&instruction), &class).await;
         }
         Some(other) => {
-            anyhow::bail!("unknown argument {other:?} (try --check, --judge, --flow or --edit)")
+            anyhow::bail!("unknown argument {other:?} (try --check, --judge, --calibrate, --flow or --edit)")
         }
         None => {}
     }
@@ -991,7 +996,12 @@ async fn check() -> anyhow::Result<()> {
         }
     );
     if cfg.judge.enabled {
+        let t = cfg.judge.thresholds();
         println!("judge:         {} backend", cfg.judge.backend);
+        println!(
+            "thresholds:    min_confidence {:.2} act_unconfirmed_above {:.2} dictation {:.2} destructive {:.2}",
+            t.min_confidence, t.act_unconfirmed_above, t.dictation_threshold, t.destructive_threshold
+        );
     } else {
         println!("judge:         disabled");
     }

@@ -9,10 +9,10 @@
 
 use parla_grammar::Intent;
 
-use crate::config::JudgeConfig;
+use crate::config::{JudgeConfig, Thresholds};
 
-/// Thresholds. Copied out of [`JudgeConfig`] so the policy can be built
-/// and tested without the rest of the config.
+/// Thresholds. Copied out of [`JudgeConfig`], resolved per backend, so the
+/// policy can be built and tested without the rest of the config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
     /// Below this intent confidence, act on nothing.
@@ -26,14 +26,20 @@ pub struct Policy {
     pub destructive_threshold: f64,
 }
 
+impl From<Thresholds> for Policy {
+    fn from(t: Thresholds) -> Self {
+        Self {
+            min_confidence: t.min_confidence,
+            act_unconfirmed_above: t.act_unconfirmed_above,
+            dictation_threshold: t.dictation_threshold,
+            destructive_threshold: t.destructive_threshold,
+        }
+    }
+}
+
 impl From<&JudgeConfig> for Policy {
     fn from(cfg: &JudgeConfig) -> Self {
-        Self {
-            min_confidence: cfg.min_confidence,
-            act_unconfirmed_above: cfg.act_unconfirmed_above,
-            dictation_threshold: cfg.dictation_threshold,
-            destructive_threshold: cfg.destructive_threshold,
-        }
+        Self::from(cfg.thresholds())
     }
 }
 
@@ -134,7 +140,7 @@ impl Policy {
 }
 
 /// The variant name, for messages that should not dump the arguments.
-fn intent_name(intent: &Intent) -> &'static str {
+pub(crate) fn intent_name(intent: &Intent) -> &'static str {
     match intent {
         Intent::LaunchApp { .. } => "launch_app",
         Intent::OpenTerminal => "open_terminal",

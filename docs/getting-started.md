@@ -202,8 +202,9 @@ the flag was set. `--check` shows whether the bus is reachable, and
 **A command is refused as "unclear" that should have worked.** Run
 `parlad --judge "<what you said>"` with `RUST_LOG=parlad=debug` to see the
 probabilities. If the intent is right but below `judge.min_confidence`,
-that is the threshold to tune; the defaults were set for the TypeSafe
-backend, not the local model.
+that is the threshold to tune. The defaults per backend come from
+`parlad --calibrate`, described in [commands.md](commands.md). Add the
+utterance to the corpus and rerun it before moving a threshold by hand.
 
 **The UI says the daemon is not running but it is.** The daemon logs "on
 the session bus as org.parla.Daemon" when it owns the name. If it does not,

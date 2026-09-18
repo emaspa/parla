@@ -55,15 +55,16 @@ pub struct JudgeConfig {
     pub backend: Backend,
     /// Give up rather than keep the user waiting on a voice command.
     pub timeout_ms: u64,
-    /// Below this intent confidence, act on nothing.
-    pub min_confidence: f64,
+    /// Below this intent confidence, act on nothing. Absent means the
+    /// backend's measured default; see [`JudgeConfig::thresholds`].
+    pub min_confidence: Option<f64>,
     /// At or above this, act without a confirmation prompt — unless the action
     /// is judged destructive, which always prompts.
-    pub act_unconfirmed_above: f64,
+    pub act_unconfirmed_above: Option<f64>,
     /// `is_dictation` at or above this means the user held the wrong hotkey.
-    pub dictation_threshold: f64,
+    pub dictation_threshold: Option<f64>,
     /// `is_destructive` at or above this forces spoken confirmation.
-    pub destructive_threshold: f64,
+    pub destructive_threshold: Option<f64>,
     /// Include window titles in what the judged path sends off the machine.
     /// Only the `typesafe` backend consults this: titles carry document
     /// names, URLs and chat subjects, so by default the request names only
@@ -80,6 +81,78 @@ pub enum Backend {
     Local,
     /// The TypeSafe System One API, over HTTPS.
     TypeSafe,
+}
+
+/// The four probabilities the policy compares against, with every value
+/// resolved: what the config said, or the backend's default where it said
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    /// Below this confidence, act on nothing.
+    pub min_confidence: f64,
+    /// At or above this, act without a confirmation prompt.
+    pub act_unconfirmed_above: f64,
+    /// `is_dictation` at or above this means the user held the wrong hotkey.
+    pub dictation_threshold: f64,
+    /// `is_destructive` at or above this forces spoken confirmation.
+    pub destructive_threshold: f64,
+}
+
+/// Measured with `parlad --calibrate corpus/judge.toml` against
+/// Qwen3-4B-Instruct-2507-Q4_K_M; the numbers and the method are in
+/// docs/commands.md. The local model's option probabilities sit near 0 or
+/// 1, so its floors are higher than TypeSafe's.
+pub const LOCAL_THRESHOLDS: Thresholds = Thresholds {
+    min_confidence: 0.35,
+    act_unconfirmed_above: 0.65,
+    dictation_threshold: 0.4,
+    destructive_threshold: 0.8,
+};
+
+/// Hand-picked for TypeSafe's calibrated outputs; not re-measured.
+pub const TYPESAFE_THRESHOLDS: Thresholds = Thresholds {
+    min_confidence: 0.45,
+    act_unconfirmed_above: 0.75,
+    dictation_threshold: 0.5,
+    destructive_threshold: 0.6,
+};
+
+impl Backend {
+    /// The thresholds this backend runs with when the config names none.
+    pub const fn default_thresholds(self) -> Thresholds {
+        match self {
+            Backend::Local => LOCAL_THRESHOLDS,
+            Backend::TypeSafe => TYPESAFE_THRESHOLDS,
+        }
+    }
+}
+
+impl JudgeConfig {
+    /// The thresholds in force: each key the config sets, and the backend's
+    /// default for each it leaves out.
+    pub fn thresholds(&self) -> Thresholds {
+        let d = self.backend.default_thresholds();
+        Thresholds {
+            min_confidence: self.min_confidence.unwrap_or(d.min_confidence),
+            act_unconfirmed_above: self
+                .act_unconfirmed_above
+                .unwrap_or(d.act_unconfirmed_above),
+            dictation_threshold: self.dictation_threshold.unwrap_or(d.dictation_threshold),
+            destructive_threshold: self
+                .destructive_threshold
+                .unwrap_or(d.destructive_threshold),
+        }
+    }
+
+    /// Write the resolved thresholds into the optional keys, so a printed
+    /// config shows the numbers in force instead of omitting them.
+    fn fill_thresholds(&mut self) {
+        let t = self.thresholds();
+        self.min_confidence = Some(t.min_confidence);
+        self.act_unconfirmed_above = Some(t.act_unconfirmed_above);
+        self.dictation_threshold = Some(t.dictation_threshold);
+        self.destructive_threshold = Some(t.destructive_threshold);
+    }
 }
 
 impl std::fmt::Display for Backend {
@@ -126,14 +199,11 @@ impl Default for JudgeConfig {
             enabled: true,
             backend: Backend::Local,
             timeout_ms: 4_000,
-            // Starting points only: these want tuning against real
-            // utterances, plotting confidence against whether the action
-            // was the one wanted. A local model's probabilities are not
-            // calibrated like TypeSafe's, so each backend wants its own.
-            min_confidence: 0.45,
-            act_unconfirmed_above: 0.75,
-            dictation_threshold: 0.5,
-            destructive_threshold: 0.6,
+            // None: the backend's own defaults apply, see `thresholds`.
+            min_confidence: None,
+            act_unconfirmed_above: None,
+            dictation_threshold: None,
+            destructive_threshold: None,
             send_window_titles: false,
             typesafe: TypeSafeConfig::default(),
         }
@@ -473,13 +543,16 @@ impl DaemonConfig {
             ("judge.dictation_threshold", j.dictation_threshold),
             ("judge.destructive_threshold", j.destructive_threshold),
         ] {
-            check_unit(name, v)?;
+            if let Some(v) = v {
+                check_unit(name, v)?;
+            }
         }
+        let t = j.thresholds();
         anyhow::ensure!(
-            j.min_confidence <= j.act_unconfirmed_above,
+            t.min_confidence <= t.act_unconfirmed_above,
             "judge.min_confidence ({}) exceeds judge.act_unconfirmed_above ({})",
-            j.min_confidence,
-            j.act_unconfirmed_above
+            t.min_confidence,
+            t.act_unconfirmed_above
         );
         anyhow::ensure!(
             self.local.context_tokens >= 512,
@@ -507,9 +580,13 @@ impl DaemonConfig {
         base.join("parla/parla.toml")
     }
 
-    /// Emit the default config file (parlad --print-default-config).
+    /// Emit the default config file (parlad --print-default-config). The
+    /// judge thresholds are printed resolved for the default backend, so
+    /// the file documents the numbers in force.
     pub fn default_toml() -> anyhow::Result<String> {
-        Ok(toml::to_string_pretty(&Self::default())?)
+        let mut cfg = Self::default();
+        cfg.judge.fill_thresholds();
+        Ok(toml::to_string_pretty(&cfg)?)
     }
 }
 
@@ -551,8 +628,11 @@ mod tests {
         c.audio.vad_threshold = -0.1;
         assert!(c.validate().is_err());
         let mut c = DaemonConfig::default();
-        c.judge.min_confidence = 0.9;
-        c.judge.act_unconfirmed_above = 0.5;
+        c.judge.min_confidence = Some(0.9);
+        c.judge.act_unconfirmed_above = Some(0.5);
+        assert!(c.validate().is_err());
+        let mut c = DaemonConfig::default();
+        c.judge.dictation_threshold = Some(1.5);
         assert!(c.validate().is_err());
         let mut c = DaemonConfig::default();
         c.local.context_tokens = 16;
@@ -566,6 +646,39 @@ mod tests {
         let mut c = DaemonConfig::default();
         c.router.confirm_window_ms = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn thresholds_resolve_per_backend_and_print_in_full() {
+        // Nothing set: each backend's own table.
+        let cfg: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.judge.thresholds(), LOCAL_THRESHOLDS);
+        let cfg: DaemonConfig = toml::from_str("[judge]\nbackend = \"typesafe\"\n").unwrap();
+        assert_eq!(cfg.judge.thresholds(), TYPESAFE_THRESHOLDS);
+        assert_eq!(cfg.judge.thresholds().act_unconfirmed_above, 0.75);
+
+        // A key that is set wins over the table, for that key only.
+        let cfg: DaemonConfig =
+            toml::from_str("[judge]\nbackend = \"typesafe\"\nmin_confidence = 0.3\n").unwrap();
+        let t = cfg.judge.thresholds();
+        assert_eq!(t.min_confidence, 0.3);
+        assert_eq!(t.dictation_threshold, TYPESAFE_THRESHOLDS.dictation_threshold);
+
+        // The printed defaults carry all four keys under their old names,
+        // with the local numbers, and load back under deny_unknown_fields.
+        let text = DaemonConfig::default_toml().unwrap();
+        for key in [
+            "min_confidence = ",
+            "act_unconfirmed_above = ",
+            "dictation_threshold = ",
+            "destructive_threshold = ",
+        ] {
+            assert!(text.contains(key), "{text}");
+        }
+        let back: DaemonConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.judge.thresholds(), LOCAL_THRESHOLDS);
+        assert_eq!(back.judge.min_confidence, Some(LOCAL_THRESHOLDS.min_confidence));
+        back.validate().unwrap();
     }
 
     #[test]

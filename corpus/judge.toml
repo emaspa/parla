@@ -1,0 +1,918 @@
+# Calibration corpus for the judged path: `parlad --calibrate corpus/judge.toml`.
+#
+# `[state]` is a synthetic desktop. Every case is judged against it, never
+# against the machine running the tool. The cases are utterances the grammar
+# does not match (the tool reports and skips any that do), each with what the
+# judge ought to make of it:
+#
+#   say            the utterance, as whisper would transcribe it
+#   expect         an intent name as the judge uses them, or "dictation" for
+#                  prose, or "unclear" for what should be refused
+#   accept         further intent names that are also right (used sparingly)
+#   target         substring of the window title, window class, application
+#                  name or desktop id that must be resolved; "focused" for the
+#                  window with focus
+#   desktop        the desktop number a virtual_desktop must name
+#   direction      next or previous, for virtual_desktop_rel
+#   payload        the text a claude_tell, notify, krunner or key must carry;
+#                  a leading "to", "that" or "the" in what was resolved is
+#                  tolerated
+#   model          opus, sonnet or haiku, for start_claude and claude_model
+#   last_dictation judge as if text was just dictated, so edit_text is offered
+#   destructive    whether the model ought to flag the action as destructive
+
+[state]
+desktop_count = 4
+current_desktop = 2
+claude_running = true
+
+[[state.apps]]
+id = "firefox.desktop"
+name = "Firefox"
+generic_name = "Web Browser"
+keywords = ["internet", "www", "browser"]
+
+[[state.apps]]
+id = "chromium.desktop"
+name = "Chromium"
+generic_name = "Web Browser"
+keywords = ["internet", "browser"]
+
+[[state.apps]]
+id = "org.kde.dolphin.desktop"
+name = "Dolphin"
+generic_name = "File Manager"
+keywords = ["files", "folders", "explorer"]
+
+[[state.apps]]
+id = "org.kde.kate.desktop"
+name = "Kate"
+generic_name = "Advanced Text Editor"
+keywords = ["editor", "text", "code"]
+
+[[state.apps]]
+id = "org.kde.kwrite.desktop"
+name = "KWrite"
+generic_name = "Text Editor"
+keywords = ["editor", "notepad"]
+
+[[state.apps]]
+id = "org.kde.konsole.desktop"
+name = "Konsole"
+generic_name = "Terminal"
+keywords = ["shell", "command line", "console"]
+
+[[state.apps]]
+id = "org.kde.spectacle.desktop"
+name = "Spectacle"
+generic_name = "Screenshot Capture Utility"
+keywords = ["screenshot", "screen capture", "snapshot"]
+
+[[state.apps]]
+id = "systemsettings.desktop"
+name = "System Settings"
+generic_name = "Configure your system"
+keywords = ["settings", "preferences", "configuration"]
+
+[[state.apps]]
+id = "org.kde.discover.desktop"
+name = "Discover"
+generic_name = "Software Center"
+keywords = ["install", "software", "app store", "packages"]
+
+[[state.apps]]
+id = "org.kde.okular.desktop"
+name = "Okular"
+generic_name = "Document Viewer"
+keywords = ["pdf", "documents", "reader"]
+
+[[state.apps]]
+id = "org.kde.gwenview.desktop"
+name = "Gwenview"
+generic_name = "Image Viewer"
+keywords = ["images", "photos", "pictures"]
+
+[[state.apps]]
+id = "libreoffice-writer.desktop"
+name = "LibreOffice Writer"
+generic_name = "Word Processor"
+keywords = ["writer", "document", "text", "word"]
+
+[[state.apps]]
+id = "thunderbird.desktop"
+name = "Thunderbird"
+generic_name = "Mail Client"
+keywords = ["email", "mail", "messages"]
+
+[[state.apps]]
+id = "vlc.desktop"
+name = "VLC media player"
+generic_name = "Media Player"
+keywords = ["video", "movie", "player", "music"]
+
+[[state.apps]]
+id = "spotify.desktop"
+name = "Spotify"
+generic_name = "Music Streaming"
+keywords = ["music", "streaming", "audio"]
+
+[[state.apps]]
+id = "discord.desktop"
+name = "Discord"
+generic_name = "Chat"
+keywords = ["chat", "voice", "gaming"]
+
+[[state.apps]]
+id = "signal-desktop.desktop"
+name = "Signal"
+generic_name = "Private Messenger"
+keywords = ["chat", "messenger", "messages"]
+
+[[state.apps]]
+id = "virtualbox.desktop"
+name = "Oracle VM VirtualBox"
+generic_name = "Virtual Machine Manager"
+keywords = ["vm", "virtual machine"]
+
+[[state.apps]]
+id = "gimp.desktop"
+name = "GIMP"
+generic_name = "Image Editor"
+keywords = ["image editor", "photo", "paint", "drawing"]
+
+[[state.apps]]
+id = "steam.desktop"
+name = "Steam"
+generic_name = "Game Store"
+keywords = ["games", "gaming"]
+
+[[state.apps]]
+id = "org.kde.kcalc.desktop"
+name = "KCalc"
+generic_name = "Scientific Calculator"
+keywords = ["calculator", "math"]
+
+[[state.apps]]
+id = "obsidian.desktop"
+name = "Obsidian"
+generic_name = "Knowledge Base"
+keywords = ["notes", "markdown", "wiki"]
+
+[[state.apps]]
+id = "org.blender.Blender.desktop"
+name = "Blender"
+generic_name = "3D Modeller"
+keywords = ["3d", "animation", "modelling"]
+
+[[state.apps]]
+id = "org.kde.elisa.desktop"
+name = "Elisa"
+generic_name = "Music Player"
+keywords = ["music", "player", "audio"]
+
+# Desktop 1 holds the work: a build in a terminal, an editor with unsaved
+# changes, mail. Desktop 2 (the current one) has the browser, the file
+# manager and a document. Desktop 3 is music and chat.
+
+[[state.windows]]
+id = "{w0}"
+title = "build — Konsole"
+class = "konsole"
+desktop = 1
+
+[[state.windows]]
+id = "{w1}"
+title = "main.rs [modified] — Kate"
+class = "kate"
+desktop = 1
+
+[[state.windows]]
+id = "{w2}"
+title = "Inbox - sparvoli@example.com - Mozilla Thunderbird"
+class = "thunderbird"
+desktop = 1
+
+[[state.windows]]
+id = "{w3}"
+title = "GitHub - Mozilla Firefox"
+class = "firefox"
+desktop = 2
+
+[[state.windows]]
+id = "{w4}"
+title = "Downloads — Dolphin"
+class = "dolphin"
+desktop = 2
+
+[[state.windows]]
+id = "{w5}"
+title = "quarterly-report.odt - LibreOffice Writer"
+class = "libreoffice-writer"
+desktop = 2
+
+[[state.windows]]
+id = "{w6}"
+title = "Spotify Premium"
+class = "spotify"
+desktop = 3
+
+[[state.windows]]
+id = "{w7}"
+title = "#general - parla - Discord"
+class = "discord"
+desktop = 3
+
+# ---------------------------------------------------------------- show_app
+
+[[case]]
+say = "bring up firefox"
+expect = "show_app"
+target = "firefox"
+destructive = false
+
+[[case]]
+say = "could you get the browser in front of me"
+expect = "show_app"
+target = "firefox"
+
+[[case]]
+say = "I want to see my email"
+expect = "show_app"
+target = "thunderbird"
+
+[[case]]
+say = "pull up the file manager"
+expect = "show_app"
+target = "dolphin"
+
+[[case]]
+say = "show me kate"
+expect = "show_app"
+target = "kate"
+destructive = false
+
+[[case]]
+say = "bring the report document to the front"
+expect = "show_app"
+target = "quarterly-report"
+
+[[case]]
+say = "I need the calculator"
+expect = "show_app"
+target = "kcalc"
+
+[[case]]
+say = "fire up gimp"
+expect = "show_app"
+target = "gimp"
+
+[[case]]
+say = "get spotify up on screen"
+expect = "show_app"
+target = "spotify"
+
+[[case]]
+say = "let me see discord"
+expect = "show_app"
+target = "discord"
+
+[[case]]
+say = "take me to the terminal"
+expect = "show_app"
+target = "konsole"
+
+[[case]]
+say = "put the system settings on screen"
+expect = "show_app"
+target = "system settings"
+
+[[case]]
+say = "run the screenshot tool"
+expect = "show_app"
+target = "spectacle"
+
+[[case]]
+say = "I'd like to look at my downloads folder"
+expect = "show_app"
+target = "dolphin"
+
+[[case]]
+say = "give me the image viewer"
+expect = "show_app"
+target = "gwenview"
+
+[[case]]
+say = "bring back the build terminal"
+expect = "show_app"
+target = "build"
+
+[[case]]
+say = "can you pop open a pdf reader"
+expect = "show_app"
+target = "okular"
+
+[[case]]
+say = "raise the github window"
+expect = "show_app"
+target = "github"
+
+[[case]]
+say = "I want to write some notes in obsidian"
+expect = "show_app"
+target = "obsidian"
+
+[[case]]
+say = "get the virtual machine manager going"
+expect = "show_app"
+target = "virtualbox"
+
+# Targets that are not installed and not open.
+
+[[case]]
+say = "bring up zoom"
+expect = "unclear"
+
+[[case]]
+say = "get me visual studio code"
+expect = "unclear"
+
+[[case]]
+say = "raise the slack window"
+expect = "unclear"
+
+[[case]]
+say = "bring up photoshop"
+expect = "unclear"
+
+# ------------------------------------------------------------ close_window
+
+[[case]]
+say = "get rid of the spotify window"
+expect = "close_window"
+target = "spotify"
+destructive = false
+
+[[case]]
+say = "kill the discord window"
+expect = "close_window"
+target = "discord"
+
+[[case]]
+say = "shut down the browser"
+expect = "close_window"
+target = "firefox"
+destructive = false
+
+[[case]]
+say = "quit the mail client"
+expect = "close_window"
+target = "thunderbird"
+
+[[case]]
+say = "get rid of the terminal running the build"
+expect = "close_window"
+target = "build"
+destructive = true
+
+[[case]]
+say = "dismiss the downloads window"
+expect = "close_window"
+target = "downloads"
+destructive = false
+
+[[case]]
+say = "quit kate"
+expect = "close_window"
+target = "kate"
+destructive = true
+
+[[case]]
+say = "shut the editor with main.rs in it"
+expect = "close_window"
+target = "main.rs"
+destructive = true
+
+[[case]]
+say = "get that window out of here"
+expect = "close_window"
+target = "focused"
+
+# --------------------------------------------------------- minimize_window
+
+[[case]]
+say = "hide the browser"
+expect = "minimize_window"
+target = "firefox"
+destructive = false
+
+[[case]]
+say = "minimise the discord window"
+expect = "minimize_window"
+target = "discord"
+
+[[case]]
+say = "put the mail window out of the way"
+expect = "minimize_window"
+target = "thunderbird"
+destructive = false
+
+[[case]]
+say = "hide the terminal"
+expect = "minimize_window"
+target = "konsole"
+destructive = false
+
+[[case]]
+say = "send kate to the taskbar"
+expect = "minimize_window"
+target = "kate"
+destructive = false
+
+[[case]]
+say = "hide this window"
+expect = "minimize_window"
+target = "focused"
+
+[[case]]
+say = "tuck spotify away for now"
+expect = "minimize_window"
+target = "spotify"
+
+# --------------------------------------------------------- maximize_window
+
+[[case]]
+say = "make the browser full screen"
+expect = "maximize_window"
+target = "firefox"
+destructive = false
+
+[[case]]
+say = "make kate fill the screen"
+expect = "maximize_window"
+target = "kate"
+destructive = false
+
+[[case]]
+say = "maximise the writer document"
+expect = "maximize_window"
+target = "quarterly-report"
+
+[[case]]
+say = "make the terminal bigger"
+expect = "maximize_window"
+target = "konsole"
+
+[[case]]
+say = "full screen the discord window"
+expect = "maximize_window"
+target = "discord"
+
+[[case]]
+say = "make this window as big as it goes"
+expect = "maximize_window"
+target = "focused"
+
+# --------------------------------------------------------- virtual_desktop
+
+[[case]]
+say = "take me to desktop three"
+expect = "virtual_desktop"
+desktop = 3
+destructive = false
+
+[[case]]
+say = "jump to the fourth desktop"
+expect = "virtual_desktop"
+desktop = 4
+
+[[case]]
+say = "put me on the first desktop"
+expect = "virtual_desktop"
+desktop = 1
+
+[[case]]
+say = "I want to be on desktop number two"
+expect = "virtual_desktop"
+desktop = 2
+
+[[case]]
+say = "hop over to desktop 1"
+expect = "virtual_desktop"
+desktop = 1
+
+[[case]]
+say = "move me to desktop nine"
+expect = "unclear"
+
+# ----------------------------------------------------- virtual_desktop_rel
+
+# From desktop 2, "the next desktop" and "desktop 3" are the same move.
+[[case]]
+say = "move to the next desktop"
+expect = "virtual_desktop_rel"
+direction = "next"
+accept = ["virtual_desktop"]
+desktop = 3
+destructive = false
+
+[[case]]
+say = "go back one desktop"
+expect = "virtual_desktop_rel"
+direction = "previous"
+
+[[case]]
+say = "one desktop to the right"
+expect = "virtual_desktop_rel"
+direction = "next"
+
+[[case]]
+say = "take me to the desktop before this one"
+expect = "virtual_desktop_rel"
+direction = "previous"
+
+[[case]]
+say = "flip to the following desktop"
+expect = "virtual_desktop_rel"
+direction = "next"
+
+[[case]]
+say = "go to the previous workspace"
+expect = "virtual_desktop_rel"
+direction = "previous"
+
+# ----------------------------------------------------------- open_terminal
+
+[[case]]
+say = "give me a fresh terminal"
+expect = "open_terminal"
+destructive = false
+
+[[case]]
+say = "I need a new shell"
+expect = "open_terminal"
+destructive = false
+
+[[case]]
+say = "spin up a console for me"
+expect = "open_terminal"
+
+[[case]]
+say = "pop a terminal open"
+expect = "open_terminal"
+
+# A Konsole window is open, so focusing it is as right as opening one.
+[[case]]
+say = "I need a terminal"
+expect = "open_terminal"
+accept = ["show_app"]
+
+# ------------------------------------------------------------ start_claude
+
+[[case]]
+say = "fire up claude code"
+expect = "start_claude"
+destructive = false
+
+[[case]]
+say = "get a claude session going with opus"
+expect = "start_claude"
+model = "opus"
+
+[[case]]
+say = "spin up claude with the small model"
+expect = "start_claude"
+model = "haiku"
+
+[[case]]
+say = "kick off a claude code session"
+expect = "start_claude"
+destructive = false
+
+[[case]]
+say = "bring claude to life using sonnet"
+expect = "start_claude"
+model = "sonnet"
+
+# ------------------------------------------------------------ claude_model
+
+[[case]]
+say = "have claude use opus from now on"
+expect = "claude_model"
+model = "opus"
+
+[[case]]
+say = "change the claude model to haiku"
+expect = "claude_model"
+model = "haiku"
+
+[[case]]
+say = "make claude use the big model"
+expect = "claude_model"
+model = "opus"
+
+[[case]]
+say = "put claude on sonnet"
+expect = "claude_model"
+model = "sonnet"
+destructive = false
+
+[[case]]
+say = "switch claude over to the quick one"
+expect = "claude_model"
+model = "haiku"
+
+# ------------------------------------------------------------- claude_tell
+
+[[case]]
+say = "have claude fix the failing test"
+expect = "claude_tell"
+payload = "fix the failing test"
+
+[[case]]
+say = "get claude to add a readme"
+expect = "claude_tell"
+payload = "add a readme"
+
+[[case]]
+say = "pass this on to claude: refactor the parser"
+expect = "claude_tell"
+payload = "refactor the parser"
+
+[[case]]
+say = "message claude that the tests are green now"
+expect = "claude_tell"
+payload = "the tests are green now"
+
+[[case]]
+say = "have claude explain the last error"
+expect = "claude_tell"
+payload = "explain the last error"
+
+[[case]]
+say = "send claude the message: run the linter"
+expect = "claude_tell"
+payload = "run the linter"
+
+# ------------------------------------------------------------- claude_read
+
+[[case]]
+say = "what's claude up to"
+expect = "claude_read"
+
+[[case]]
+say = "show me what claude said"
+expect = "claude_read"
+
+[[case]]
+say = "what did claude code answer"
+expect = "claude_read"
+
+[[case]]
+say = "read me the claude output"
+expect = "claude_read"
+destructive = false
+
+[[case]]
+say = "check on claude"
+expect = "claude_read"
+
+# ----------------------------------------------------------------- krunner
+
+[[case]]
+say = "look up last year's tax return"
+expect = "krunner"
+payload = "last year's tax return"
+
+[[case]]
+say = "locate the invoice pdf"
+expect = "krunner"
+payload = "invoice pdf"
+
+[[case]]
+say = "can you look for the vacation photos"
+expect = "krunner"
+payload = "vacation photos"
+
+[[case]]
+say = "track down my thesis draft"
+expect = "krunner"
+payload = "my thesis draft"
+
+[[case]]
+say = "where is the file called budget"
+expect = "krunner"
+payload = "budget"
+
+# ------------------------------------------------------------------ notify
+
+[[case]]
+say = "remind me on screen that the meeting is at three"
+expect = "notify"
+payload = "the meeting is at three"
+
+[[case]]
+say = "pop up a note saying lunch is ready"
+expect = "notify"
+payload = "lunch is ready"
+
+[[case]]
+say = "flash a message: build finished"
+expect = "notify"
+payload = "build finished"
+
+[[case]]
+say = "put a notification up that says call mum"
+expect = "notify"
+payload = "call mum"
+
+[[case]]
+say = "let me know with a notification that the pizza is here"
+expect = "notify"
+payload = "the pizza is here"
+
+# --------------------------------------------------------------------- key
+
+[[case]]
+say = "hit control s"
+expect = "key"
+payload = "control s"
+
+[[case]]
+say = "send an escape keystroke"
+expect = "key"
+payload = "escape"
+
+[[case]]
+say = "push alt f4"
+expect = "key"
+payload = "alt f4"
+
+[[case]]
+say = "hit enter"
+expect = "key"
+payload = "enter"
+
+[[case]]
+say = "send control shift t"
+expect = "key"
+payload = "control shift t"
+
+# --------------------------------------------------------------- edit_text
+
+[[case]]
+say = "make that more formal"
+expect = "edit_text"
+last_dictation = true
+
+[[case]]
+say = "shorter"
+expect = "edit_text"
+last_dictation = true
+
+[[case]]
+say = "turn that into bullet points"
+expect = "edit_text"
+last_dictation = true
+
+[[case]]
+say = "translate that to italian"
+expect = "edit_text"
+last_dictation = true
+
+[[case]]
+say = "capitalise the first word"
+expect = "edit_text"
+last_dictation = true
+
+[[case]]
+say = "rewrite it in a friendlier tone"
+expect = "edit_text"
+last_dictation = true
+
+[[case]]
+say = "add a greeting at the top"
+expect = "edit_text"
+last_dictation = true
+
+# --------------------------------------------------------------- dictation
+# Prose spoken with the command key held. The last two read like commands.
+
+[[case]]
+say = "The quarterly report shows a modest increase in revenue over last year."
+expect = "dictation"
+
+[[case]]
+say = "Thanks for your email, I'll get back to you by Thursday."
+expect = "dictation"
+
+[[case]]
+say = "Hi Sarah, could you send me the slides from yesterday's meeting?"
+expect = "dictation"
+
+[[case]]
+say = "I think we should move the deadline to the end of the month."
+expect = "dictation"
+
+[[case]]
+say = "The function returns null when the input list is empty."
+expect = "dictation"
+
+[[case]]
+say = "Let's meet at the cafe on the corner at half past two."
+expect = "dictation"
+
+[[case]]
+say = "Dear Mr Rossi, thank you for your order, it will ship on Monday."
+expect = "dictation"
+
+[[case]]
+say = "Remember to buy milk, eggs and bread on the way home."
+expect = "dictation"
+
+[[case]]
+say = "The patient was discharged on the third day with no complications."
+expect = "dictation"
+
+[[case]]
+say = "I'm running about ten minutes late, start without me."
+expect = "dictation"
+
+[[case]]
+say = "This pull request adds retries to the upload path and fixes a race in the cache."
+expect = "dictation"
+
+[[case]]
+say = "Sounds good, see you tomorrow."
+expect = "dictation"
+
+[[case]]
+say = "Please close the door when you leave the office."
+expect = "dictation"
+
+[[case]]
+say = "Open the window a little, it's hot in here."
+expect = "dictation"
+
+# ----------------------------------------------------------------- unclear
+# Questions, gibberish, references with nothing to refer to, and requests
+# for things parla cannot do.
+
+[[case]]
+say = "what's the weather like tomorrow"
+expect = "unclear"
+
+[[case]]
+say = "how many desktops do I have"
+expect = "unclear"
+
+[[case]]
+say = "banana keyboard purple"
+expect = "unclear"
+
+[[case]]
+say = "um so yeah"
+expect = "unclear"
+
+[[case]]
+say = "what time is it"
+expect = "unclear"
+
+[[case]]
+say = "do the thing"
+expect = "unclear"
+
+[[case]]
+say = "the other one"
+expect = "unclear"
+
+[[case]]
+say = "that window"
+expect = "unclear"
+
+[[case]]
+say = "can you help me with something"
+expect = "unclear"
+
+[[case]]
+say = "who won the match last night"
+expect = "unclear"
+
+[[case]]
+say = "delete all my files"
+expect = "unclear"
+
+[[case]]
+say = "reboot the computer"
+expect = "unclear"
+
+[[case]]
+say = "turn the volume up"
+expect = "unclear"
+
+[[case]]
+say = "lock the screen"
+expect = "unclear"
+
+[[case]]
+say = "asdf qwerty"
+expect = "unclear"
